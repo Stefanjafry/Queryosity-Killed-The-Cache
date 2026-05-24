@@ -5,7 +5,10 @@ from src.simulator.cache_simulator import (
     PageClockSweepCache,
     SimulationResult,
     approximate_schedule_fitness,
+    approximate_schedule_fitness_directional,
+    compute_directional_matrix,
     compute_overlap_matrix,
+    compute_residual,
     simulate_schedule,
     simulate_schedule_page_level,
 )
@@ -265,3 +268,151 @@ class TestSimulateSchedulePageLevel:
         result = simulate_schedule_page_level([], [], cache_capacity_pages=10)
         assert result.total_requests == 0
         assert result.total_hits == 0
+
+class TestComputeResidual:
+    def test_empty_pages(self):
+        assert compute_residual(frozenset(), cache_capacity_pages=10) == frozenset()
+
+    def test_zero_capacity(self):
+        assert compute_residual(frozenset({0, 1, 2}), cache_capacity_pages=0) == frozenset()
+
+    def test_fits_in_cache(self):
+        # |P| <= C => everything survives, R == P
+        pages = frozenset({0, 1, 2, 3})
+        residual = compute_residual(pages, cache_capacity_pages=10)
+        assert residual == pages
+
+    def test_exact_fit(self):
+        # |P| == C => still everything fits, R == P
+        pages = frozenset({0, 1, 2, 3})
+        residual = compute_residual(pages, cache_capacity_pages=4)
+        assert residual == pages
+
+    def test_subset_when_oversized(self):
+        # |P| > C => R is a non-empty subset of P bounded by capacity
+        pages = frozenset(range(20))
+        residual = compute_residual(pages, cache_capacity_pages=5)
+        assert residual.issubset(pages)
+        assert len(residual) <= 5
+        # Under clock-sweep on a cold cache with capacity 5 and 20 inserts,
+        # the cache fills to capacity and stays full.
+        assert len(residual) == 5
+
+
+class TestComputeDirectionalMatrix:
+    def test_empty(self):
+        assert compute_directional_matrix([], cache_capacity_pages=10) == []
+
+    def test_diagonal_is_zero(self):
+        page_sets = [
+            frozenset({0, 1, 2}),
+            frozenset({2, 3, 4}),
+            frozenset({4, 5, 6}),
+        ]
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=100)
+        for i in range(len(D)):
+            assert D[i][i] == 0
+
+    def test_directional_equals_symmetric_when_no_eviction(self):
+        # Invariant: when every query fits entirely in cache,
+        # D[i][j] == M[i][j] for all i != j.
+        page_sets = [
+            frozenset({0, 1, 2}),
+            frozenset({2, 3, 4}),
+            frozenset({4, 5, 6, 0}),
+        ]
+        big_capacity = 100
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=big_capacity)
+        M = compute_overlap_matrix(page_sets)
+        n = len(page_sets)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                assert D[i][j] == M[i][j], (
+                    f"D[{i}][{j}]={D[i][j]} vs M[{i}][{j}]={M[i][j]}"
+                )
+
+    def test_directional_bounded_by_symmetric(self):
+        # Invariant: residual is always a subset of P(Qi),
+        # so D[i][j] <= M[i][j] for all i, j.
+        # Use a workload with real eviction pressure so the bound is
+        # strict for at least one pair.
+        page_sets = [
+            frozenset(range(0, 30)),    # Lq overlapping with q1 on {10..19}
+            frozenset(range(10, 20)),   # small
+            frozenset(range(15, 45)),   # another Lq
+        ]
+        capacity = 12  # forces eviction for the large queries
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=capacity)
+        M = compute_overlap_matrix(page_sets)
+        n = len(page_sets)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                assert D[i][j] <= M[i][j], (
+                    f"D[{i}][{j}]={D[i][j]} exceeds M[{i}][{j}]={M[i][j]}"
+                )
+
+    def test_directional_asymmetry_under_pressure(self):
+        # Construct a clear large -> small scenario.
+        # Lq has 30 pages, capacity is 10, so 20 of them evict before
+        # any subsequent query starts.  Small Sq has 5 pages that all
+        # appear in Lq.  M[L][S] = 5, but D[L][S] can be strictly less.
+        Lq = frozenset(range(30))
+        Sq = frozenset({0, 1, 2, 3, 4})
+        page_sets = [Lq, Sq]
+        capacity = 10
+
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=capacity)
+        M = compute_overlap_matrix(page_sets)
+
+        # All of Sq's pages overlap with Lq, so M is symmetric and equal to |Sq|.
+        assert M[0][1] == 5
+        assert M[1][0] == 5
+        # Sq fits entirely, so its residual is Sq itself; D[Sq][Lq] = 5.
+        assert D[1][0] == 5
+        # Lq does not fit; pages 0..19 are evicted under clock-sweep.
+        # Therefore D[Lq][Sq] < 5 (most of Sq's pages were among the evicted).
+        assert D[0][1] < M[0][1]
+
+
+class TestApproximateScheduleFitnessDirectional:
+    def test_empty_schedule(self):
+        f = approximate_schedule_fitness_directional([], [], [])
+        assert f == 0.0
+
+    def test_single_query(self):
+        # No predecessor => no hits estimated.
+        page_sets = [frozenset({0, 1, 2})]
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=10)
+        f = approximate_schedule_fitness_directional(D, [3], [0])
+        assert f == 0.0
+
+    def test_edge_sum(self):
+        page_sets = [
+            frozenset({0, 1, 2}),
+            frozenset({1, 2, 3}),
+        ]
+        # No eviction pressure, so D[0][1] = M[0][1] = 2 pages shared.
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=100)
+        page_counts = [3, 3]
+        # Schedule q0 then q1: 2 estimated hits out of 6 page requests.
+        f = approximate_schedule_fitness_directional(D, page_counts, [0, 1])
+        assert abs(f - 2 / 6) < 1e-9
+
+    def test_directional_distinguishes_orderings(self):
+        # Lq has 30 pages, Sq's 5 pages are all in Lq.  Capacity 10:
+        # only ~10 of Lq survive (and probably not Sq's 5 pages).
+        # Schedule Sq -> Lq should score better than Lq -> Sq under the
+        # directional approximation because all of Sq survives.
+        Lq = frozenset(range(30))
+        Sq = frozenset({0, 1, 2, 3, 4})
+        page_sets = [Lq, Sq]
+        capacity = 10
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=capacity)
+        page_counts = [len(ps) for ps in page_sets]
+        fit_L_first = approximate_schedule_fitness_directional(D, page_counts, [0, 1])
+        fit_S_first = approximate_schedule_fitness_directional(D, page_counts, [1, 0])
+        assert fit_S_first > fit_L_first

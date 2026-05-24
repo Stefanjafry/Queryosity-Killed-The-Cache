@@ -23,7 +23,6 @@ import numpy as np
 
 from src.simulator.cache_simulator import ClockSweepCache
 from src.simulator.access_profile import AccessProfile
-from src.simulator.simulator_types import PageSet
 
 
 logger = logging.getLogger(__name__)
@@ -185,7 +184,7 @@ class DQN:
         individual: list[int],
         profiles: list[AccessProfile],
         cache_capacity_pages: int,
-        page_sets: list[PageSet] | None = None
+        page_sets: list[frozenset[int]] | None = None
     ) -> float:
         """
         Evaluate the fitness of a query schedule using DQN inference.
@@ -204,7 +203,7 @@ class DQN:
             Access profiles for all queries, indexed by query index.
         cache_capacity_pages : int
             LRU cache capacity in 8 KB pages.
-        page_sets : list[PageSet] or None, optional
+        page_sets : list[frozenset[int]] or None, optional
             Unused. Accepted for compatibility with the
             ``FitnessFunction`` protocol. A warning is emitted if a
             non-None value is provided.

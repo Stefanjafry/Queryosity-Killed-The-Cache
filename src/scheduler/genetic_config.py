@@ -34,6 +34,19 @@ Types of supported fitness functions.
 """
 
 
+ApproxMode = Literal["symmetric", "directional"]
+"""
+Variant of approximate fitness used when ``use_approximate_fitness`` is True.
+
+- ``"symmetric"``: precomputed pairwise overlap matrix ``M[i][j] =
+  |P(Qᵢ) ∩ P(Qⱼ)|`` with the windowed triple-intersection discount.
+- ``"directional"``: precomputed directional utility matrix
+  ``D[i][j] = |R(Qᵢ; C) ∩ P(Qⱼ)|`` with edge-local fitness summation,
+  capturing the asymmetry between large→small and small→large
+  transitions under eviction pressure.
+"""
+
+
 @dataclass
 class GAConfig:
     """
@@ -72,6 +85,11 @@ class GAConfig:
         ``fitness_type == "lru"``), use the precomputed overlap matrix
         for fast approximate fitness during evolution.  The final best
         schedule is always validated with the exact clock-sweep simulation.
+    approx_mode : ApproxMode
+        Variant of approximate fitness.  ``"symmetric"`` uses the
+        precomputed page-overlap matrix; ``"directional"`` uses the
+        residual-aware directional utility matrix.  Ignored when
+        ``use_approximate_fitness`` is False.
     """
 
     population_size: int = 100
@@ -87,3 +105,4 @@ class GAConfig:
     dqn: "DQN | None" = None
     seed: int | None = None
     use_approximate_fitness: bool = False
+    approx_mode: ApproxMode = "symmetric"

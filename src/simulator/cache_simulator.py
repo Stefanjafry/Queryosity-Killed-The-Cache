@@ -376,12 +376,133 @@ class PageClockSweepCache:
 
         return hit_count
 
+    def resident_pages(self) -> frozenset[int]:
+        """
+        Return the set of pages currently resident in the cache.
+
+        This is a snapshot of the cache state, used to compute per-query
+        residuals R(Qᵢ; C) for the directional utility matrix.
+
+        Returns
+        -------
+        frozenset[int]
+            Integer page IDs currently held in the buffer pool.
+        """
+        return frozenset(self._lookup.keys())
+
     def reset(self) -> None:
         """Clear all entries from the cache."""
         self._page_ids.clear()
         self._usage.clear()
         self._lookup.clear()
         self._hand = 0
+
+
+# ---------------------------------------------------------------------------
+# Per-query residuals and directional utility matrix
+# ---------------------------------------------------------------------------
+
+
+def compute_residual(
+    pages: frozenset[int],
+    cache_capacity_pages: int,
+) -> frozenset[int]:
+    """
+    Pages from a query that survive a cold-cache run under clock-sweep.
+
+    Runs *pages* through a fresh ``PageClockSweepCache`` of the given
+    capacity and snapshots the resident set afterwards.  This defines
+    the residual ``R(Q; C)`` used by the directional matrix:
+
+        R(Q; C) = pages of Q still resident after Q runs alone
+                  starting from a cold cache of capacity C
+
+    Cases collapse cleanly:
+
+    * ``|pages| ≤ C`` → ``R = pages`` (everything fits, nothing evicts)
+    * ``|pages| > C`` → policy-dependent; matches what the simulator
+      actually leaves behind under clock-sweep
+
+    Because the residual is computed by the same simulator that scores
+    final schedules, the directional matrix is a faithful projection of
+    simulator behaviour rather than an analytical guess.
+
+    Parameters
+    ----------
+    pages : frozenset[int]
+        Integer-encoded page set for a single query.
+    cache_capacity_pages : int
+        Cache capacity in pages.
+
+    Returns
+    -------
+    frozenset[int]
+        Subset of *pages* still resident after a cold-cache batch access.
+    """
+    if cache_capacity_pages <= 0 or not pages:
+        return frozenset()
+    cache = PageClockSweepCache(cache_capacity_pages)
+    cache.batch_access(pages)
+    return cache.resident_pages()
+
+
+def compute_directional_matrix(
+    page_sets: list[frozenset[int]],
+    cache_capacity_pages: int,
+) -> list[list[int]]:
+    """
+    Directional pairwise utility matrix ``D[i][j] = |R(Qᵢ; C) ∩ P(Qⱼ)|``.
+
+    Unlike the symmetric overlap matrix from ``compute_overlap_matrix``,
+    this matrix is direction-aware: ``D[i][j]`` is the count of pages
+    that survive running Qᵢ alone *and* are needed by Qⱼ — i.e. the
+    cache hits Qⱼ would get if it ran immediately after Qᵢ from a cold
+    cache.
+
+    For a small query S and a large query L with ``|P(L)| > C``, ``D``
+    correctly captures the asymmetry that ``M`` misses:
+
+    * ``D[S][L]`` ≈ ``|P(S) ∩ P(L)|`` (all of S survives, so its
+      overlap with L is available as hits)
+    * ``D[L][S]`` can be much smaller (most of L evicts, only the tail
+      that survived clock-sweep is available for S)
+
+    The diagonal is set to 0 by convention to keep the matrix usable as
+    edge weights in an Asymmetric TSP formulation of the scheduling
+    problem.
+
+    Complexity
+    ----------
+    O(n) cold-cache runs to build residuals, plus O(n²) set
+    intersections.  Each residual run is one ``batch_access`` call.
+
+    Parameters
+    ----------
+    page_sets : list[frozenset[int]]
+        Per-query page sets (integer-encoded).
+    cache_capacity_pages : int
+        Cache capacity in pages; defines which pages survive eviction.
+
+    Returns
+    -------
+    list[list[int]]
+        Asymmetric *n* x *n* directional utility matrix.  ``D[i][j]``
+        and ``D[j][i]`` may differ.
+    """
+    n = len(page_sets)
+    residuals = [
+        compute_residual(ps, cache_capacity_pages) for ps in page_sets
+    ]
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        res_i = residuals[i]
+        if not res_i:
+            continue
+        for j in range(n):
+            if i == j:
+                continue
+            matrix[i][j] = len(res_i & page_sets[j])
+    return matrix
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +634,74 @@ def approximate_schedule_fitness(
         if hits_for_q > page_counts[q]:
             hits_for_q = page_counts[q]
         total_hits += hits_for_q
+
+    return total_hits / total_requests
+
+
+def approximate_schedule_fitness_directional(
+    directional_matrix: list[list[int]],
+    page_counts: list[int],
+    schedule: list[int],
+) -> float:
+    """
+    Edge-local approximate fitness using the directional utility matrix.
+
+    For each position *k* in the schedule, the expected hits for Qⱼ at
+    position *k* are estimated as ``D[π(k-1)][π(k)]`` — the pages from
+    the previous query that survived clock-sweep eviction *and* are
+    needed by Qⱼ.  Hits are capped at the query's own page count.
+
+    This is the directional analogue of ``approximate_schedule_fitness``
+    but intentionally simpler: there is no sliding-window discount,
+    because the residual is already a faithful projection of what
+    survives in cache after Qᵢ runs alone.  The transitive effect —
+    that what is in cache when Qⱼ starts depends on Q(j-2), Q(j-3), …
+    not just Q(j-1) — is *not* modelled here.  Reviewers should read
+    this as edge-local directional utility, with the GA's final
+    scoring under full clock-sweep simulation handling the transitive
+    structure.
+
+    Complexity
+    ----------
+    O(n) per call, where n is the schedule length.  Strictly faster
+    than the windowed symmetric variant.
+
+    Parameters
+    ----------
+    directional_matrix : list[list[int]]
+        Precomputed directional utility matrix from
+        ``compute_directional_matrix``.  Must be built with the same
+        ``cache_capacity_pages`` the schedule will be simulated under.
+    page_counts : list[int]
+        Number of distinct pages per query (same indexing as
+        *directional_matrix*).
+    schedule : list[int]
+        Permutation of query indices representing execution order.
+
+    Returns
+    -------
+    float
+        Approximate cache hit ratio in [0.0, 1.0].
+    """
+    n = len(schedule)
+    if n == 0:
+        return 0.0
+
+    total_requests = 0
+    for idx in schedule:
+        total_requests += page_counts[idx]
+    if total_requests == 0:
+        return 0.0
+
+    total_hits = 0
+    for k in range(1, n):
+        prev = schedule[k - 1]
+        cur = schedule[k]
+        hits = directional_matrix[prev][cur]
+        # Cap at the query's own page count
+        if hits > page_counts[cur]:
+            hits = page_counts[cur]
+        total_hits += hits
 
     return total_hits / total_requests
 

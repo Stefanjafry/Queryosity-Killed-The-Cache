@@ -219,3 +219,53 @@ class TestRunGA:
         r2 = run_ga(profiles, config)
         assert r1.best_schedule == r2.best_schedule
         assert r1.best_fitness == r2.best_fitness
+
+
+class TestDirectionalApproximateFitness:
+    """Smoke tests for the --approx-mode directional GA path."""
+
+    def _make_profiles(self):
+        return [
+            AccessProfile(query_id="q0", table_pages={"A": 10, "B": 5}),
+            AccessProfile(query_id="q1", table_pages={"C": 10}),
+            AccessProfile(query_id="q2", table_pages={"A": 10, "D": 5}),
+            AccessProfile(query_id="q3", table_pages={"C": 10, "E": 5}),
+        ]
+
+    def test_ga_runs_directional_end_to_end(self):
+        profiles = self._make_profiles()
+        page_sets = [
+            frozenset({0, 1, 2, 3}),
+            frozenset({10, 11, 12}),
+            frozenset({0, 1, 2, 20}),
+            frozenset({10, 11, 12, 30}),
+        ]
+        config = GAConfig(
+            population_size=20,
+            num_generations=10,
+            seed=42,
+            cache_capacity_pages=50,
+            use_approximate_fitness=True,
+            approx_mode="directional",
+        )
+        result = run_ga(profiles, config, page_sets=page_sets)
+        assert sorted(result.best_schedule) == [0, 1, 2, 3]
+        # Final fitness is always exact simulation.
+        assert 0.0 <= result.best_fitness <= 1.0
+
+    def test_greedy_directional_baseline_returns_permutation(self):
+        from src.scheduler.greedy_directional import (
+            greedy_directional_schedule,
+        )
+        from src.simulator.cache_simulator import compute_directional_matrix
+
+        page_sets = [
+            frozenset(range(0, 30)),
+            frozenset({0, 1, 2, 3, 4}),
+            frozenset({0, 1, 2, 25, 26}),
+            frozenset(range(20, 40)),
+        ]
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=10)
+        page_counts = [len(ps) for ps in page_sets]
+        schedule = greedy_directional_schedule(D, page_counts=page_counts)
+        assert sorted(schedule) == [0, 1, 2, 3]

@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.WARNING)
 
 from src.postgres.connection import close_connection, create_connection
 from src.scheduler.genetic_algorithm import GAScheduler
-from src.scheduler.genetic_config import FitnessType, GAConfig
+from src.scheduler.genetic_config import ApproxMode, FitnessType, GAConfig
 from src.simulator.access_profile import build_access_profiles_from_db
 from src.profiler.page_profiler import load_all_page_access
 from src.simulator.cache_simulator import (
@@ -102,6 +102,9 @@ class Args(argparse.Namespace):
     schema: str
     timeout_ms: int
     onnx_path: Path
+    approximate: bool
+    approx_mode: ApproxMode
+    greedy_baseline: bool
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -167,6 +170,22 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Use overlap-matrix approximate fitness during GA evolution "
              "(faster, final result still uses exact simulation)",
+    )
+    parser.add_argument(
+        "--approx-mode",
+        choices=["symmetric", "directional"],
+        default="symmetric",
+        help="Variant of approximate fitness when --approximate is set. "
+             "'symmetric' uses |P(Qi) ∩ P(Qj)|; 'directional' uses "
+             "|R(Qi;C) ∩ P(Qj)|, which captures large→small vs small→large "
+             "asymmetry under eviction pressure. (default: symmetric)",
+    )
+    parser.add_argument(
+        "--greedy-baseline",
+        action="store_true",
+        help="Also report a greedy nearest-neighbour schedule on the "
+             "directional matrix as an extra baseline. Requires "
+             "page-level data; computes the directional matrix once.",
     )
     parser.add_argument("--host", default=PG_HOST)
     parser.add_argument("--port", type=int, default=PG_PORT)
@@ -242,6 +261,36 @@ def main(argv: list[str] | None = None) -> None:
         page_sets=page_sets,
     )
 
+    # Optional: greedy nearest-neighbour on the directional matrix.
+    # This is a free extra baseline; the matrix is independent of the GA
+    # so success here would argue the directional signal is useful on
+    # its own, regardless of the search algorithm consuming it.
+    if args.greedy_baseline:
+        if page_sets is None:
+            print(
+                "\n  --greedy-baseline requires page-level data; "
+                "skipping (no page_access/ files found)."
+            )
+        else:
+            from src.scheduler.greedy_directional import (
+                greedy_directional_schedule,
+            )
+            from src.simulator.cache_simulator import (
+                compute_directional_matrix,
+            )
+            print("\nBuilding directional matrix for greedy baseline…")
+            t0 = time.perf_counter()
+            d_matrix = compute_directional_matrix(page_sets, args.cache_pages)
+            page_counts_for_greedy = [len(ps) for ps in page_sets]
+            greedy_perm = greedy_directional_schedule(
+                d_matrix, page_counts=page_counts_for_greedy,
+            )
+            print(f"  Done in {time.perf_counter() - t0:.2f}s")
+            _print_schedule(
+                profiles, greedy_perm, args.cache_pages,
+                "Baseline (greedy directional)", page_sets=page_sets,
+            )
+
     all_tables = sorted(list(set(t for p in profiles for t in p.table_pages)))
     max_pages = {
         t: max(p.table_pages.get(t, 0) for p in profiles)
@@ -271,9 +320,13 @@ def main(argv: list[str] | None = None) -> None:
             dqn=dqn,
             seed=args.seed,
             use_approximate_fitness=args.approximate,
+            approx_mode=args.approx_mode,
         )
 
-        mode = "approximate" if ga_config.use_approximate_fitness else "exact"
+        if ga_config.use_approximate_fitness:
+            mode = f"approximate ({ga_config.approx_mode})"
+        else:
+            mode = "exact"
 
         def on_gen(gen: int, best: float) -> None:
             if gen % 50 == 0 or gen == ga_config.num_generations - 1:

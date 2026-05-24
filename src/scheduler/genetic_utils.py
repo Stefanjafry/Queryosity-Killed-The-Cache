@@ -43,10 +43,10 @@ from src.scheduler.genetic_config import GAConfig
 from src.simulator.access_profile import AccessProfile
 from src.simulator.cache_simulator import (
     approximate_schedule_fitness,
+    approximate_schedule_fitness_directional,
     simulate_schedule,
     simulate_schedule_page_level,
 )
-from src.simulator.simulator_types import PageSet
 
 
 class FitnessFunction(Protocol):
@@ -68,7 +68,7 @@ class FitnessFunction(Protocol):
         individual: list[int],
         profiles: list[AccessProfile],
         cache_capacity_pages: int,
-        page_sets: list[PageSet] | None,
+        page_sets: list[frozenset[int]] | None,
     ) -> float:
         """
         Evaluate the fitness of a query schedule.
@@ -82,7 +82,7 @@ class FitnessFunction(Protocol):
             Access profiles for all queries, indexed by query index.
         cache_capacity_pages : int
             Clock-sweep cache capacity in 8 KB pages.
-        page_sets : list[PageSet] or None
+        page_sets : list[frozenset[int]] or None
             Optional precomputed page sets for each query.  Implementations
             may use this for page-level granularity or ignore it.
 
@@ -423,6 +423,52 @@ class IndividualApproximate(Individual):
         return self._fitness
 
 
+@dataclass
+class IndividualDirectional(Individual):
+    """
+    An Individual that evaluates fitness using the directional utility matrix.
+
+    Used during GA evolution when ``config.approx_mode == "directional"``.
+    The directional matrix ``D[i][j] = |R(Qᵢ; C) ∩ P(Qⱼ)|`` captures
+    the asymmetry between large→small and small→large transitions that
+    the symmetric overlap matrix misses.  The final best schedule is
+    always re-scored by the exact clock-sweep simulator in run_ga.
+
+    Attributes
+    ----------
+    directional_matrix : list[list[int]]
+        Asymmetric pairwise directional matrix from
+        ``compute_directional_matrix``.  Must be built with the same
+        cache capacity used by the simulator.
+    page_counts : list[int]
+        Number of distinct pages per query, same indexing as directional_matrix.
+    """
+
+    directional_matrix: list[list[int]]
+    page_counts: list[int]
+
+    def fitness(self) -> float:
+        """
+        Return the directional approximate fitness of this individual.
+
+        Evaluates and caches the fitness on the first call as the
+        edge-local sum ``Σ D[π(k-1)][π(k)]`` divided by total page
+        requests.  Subsequent calls return the cached value.
+
+        Returns
+        -------
+        float
+            Approximate cache hit ratio in the range [0.0, 1.0].
+        """
+        if self._fitness is None:
+            self._fitness = approximate_schedule_fitness_directional(
+                self.directional_matrix,
+                self.page_counts,
+                self.schedule,
+            )
+        return self._fitness
+
+
 def make_individual(
     schedule: list[int],
     profiles: list[AccessProfile],
@@ -432,6 +478,7 @@ def make_individual(
     page_sets: Optional[list[frozenset[int]]],
     overlap_matrix: Optional[list[list[int]]] = None,
     page_counts: Optional[list[int]] = None,
+    directional_matrix: Optional[list[list[int]]] = None,
 ) -> Individual:
     """
     Construct the appropriate Individual subtype for the configured fitness mode.
@@ -442,6 +489,10 @@ def make_individual(
 
     Dispatch rules:
     * When ``config.use_approximate_fitness`` is True, ``fitness_type``
+      is ``"lru"``, ``config.approx_mode == "directional"``, and page-level
+      data (``page_sets``, ``directional_matrix``, ``page_counts``) is
+      provided, returns an ``IndividualDirectional``.
+    * Else when ``config.use_approximate_fitness`` is True, ``fitness_type``
       is ``"lru"``, and page-level data (``page_sets``, ``overlap_matrix``,
       ``page_counts``) is provided, returns an ``IndividualApproximate``.
     * Else, if ``page_sets`` is provided, returns an ``IndividualWithPageSet``.
@@ -464,16 +515,21 @@ def make_individual(
         an Individual using table-level simulation is returned.
     overlap_matrix : list[list[int]] or None
         Precomputed pairwise overlap matrix.  Required when
-        ``config.use_approximate_fitness`` is True.
+        ``config.use_approximate_fitness`` is True and
+        ``config.approx_mode == "symmetric"``.
     page_counts : list[int] or None
         Per-query page counts.  Required when
         ``config.use_approximate_fitness`` is True.
+    directional_matrix : list[list[int]] or None
+        Precomputed directional utility matrix.  Required when
+        ``config.use_approximate_fitness`` is True and
+        ``config.approx_mode == "directional"``.
 
     Returns
     -------
     Individual
-        IndividualApproximate, IndividualWithPageSet, or Individual as
-        dictated by the dispatch rules above.
+        IndividualDirectional, IndividualApproximate, IndividualWithPageSet,
+        or Individual as dictated by the dispatch rules above.
 
     Raises
     ------
@@ -491,6 +547,25 @@ def make_individual(
         fitness_fn = config.dqn.infer
     else:
         raise ValueError(f"Unknown fitness type: {config.fitness_type}")
+
+    if (
+        config.fitness_type == "lru"
+        and config.use_approximate_fitness
+        and config.approx_mode == "directional"
+        and page_sets is not None
+        and directional_matrix is not None
+        and page_counts is not None
+    ):
+        return IndividualDirectional(
+            schedule=schedule,
+            profiles=profiles,
+            cache_capacity_pages=cache_capacity_pages,
+            _rng=rng,
+            _config=config,
+            _fitness_fn=fitness_fn,
+            directional_matrix=directional_matrix,
+            page_counts=page_counts,
+        )
 
     if (
         config.fitness_type == "lru"
@@ -570,6 +645,7 @@ __all__ = [
     "Individual",
     "IndividualWithPageSet",
     "IndividualApproximate",
+    "IndividualDirectional",
     "make_individual",
     "select_parents",
 ]
