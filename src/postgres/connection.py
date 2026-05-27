@@ -16,6 +16,15 @@ def create_connection(
     """
     Create and configure a PostgreSQL connection.
 
+    Sets the search_path, statement_timeout, and -- crucially for the
+    cache-aware scheduler -- forces ``enable_seqscan = off`` at session
+    level.  The cache-residue model in this project assumes index-driven
+    access patterns; large sequential scans trigger PostgreSQL's
+    ring-buffer behaviour, producing eviction patterns the simulator
+    does not model.  Enforcing the setting per-session protects the
+    experiment if the server-level default ever drifts (e.g. a fresh
+    install, a colleague's local config, a managed Postgres).
+
     Parameters
     ----------
     db_name : str
@@ -42,7 +51,8 @@ def create_connection(
     Raises
     ------
     RuntimeError
-        If the connection cannot be established or configured.
+        If the connection cannot be established, configured, or if
+        ``enable_seqscan`` could not be forced off.
     """
     try:
         connection = psycopg.connect(
@@ -63,6 +73,15 @@ def create_connection(
                 sql.SQL("SET statement_timeout TO {};")
                     .format(sql.Literal(statement_timeout_ms))
             )
+            cursor.execute("SET enable_seqscan = off;")
+            cursor.execute("SHOW enable_seqscan;")
+            row = cursor.fetchone()
+            value = row[0] if row else None
+            if value != "off":
+                raise RuntimeError(
+                    f"Failed to set enable_seqscan=off "
+                    f"(SHOW returned: {value!r})"
+                )
 
         return connection
 

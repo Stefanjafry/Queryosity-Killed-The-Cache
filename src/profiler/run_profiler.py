@@ -49,7 +49,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--container",
         default=PG_CONTAINER_NAME,
-        help=f"Docker container name (default: {PG_CONTAINER_NAME})",
+        help=f"Docker container name (default: {PG_CONTAINER_NAME}). "
+             "Ignored when --flush-cmd is given.",
+    )
+    parser.add_argument(
+        "--flush-cmd",
+        default=None,
+        help="Shell command to flush the buffer cache, e.g. "
+             "'sudo systemctl restart postgresql-16' for native installs. "
+             "Falls back to 'docker restart <--container>' if omitted.",
     )
     parser.add_argument("--host", default=PG_HOST)
     parser.add_argument("--port", type=int, default=PG_PORT)
@@ -90,7 +98,12 @@ def main(argv: list[str] | None = None) -> None:
     for i, (query_id, sql) in enumerate(queries.items(), 1):
         print(f"\n[{i}/{len(queries)}] Profiling {query_id}…")
 
-        flush_buffer_cache(args.container)
+        flush_args = (
+            {"flush_cmd": args.flush_cmd}
+            if args.flush_cmd
+            else {"container_name": args.container}
+        )
+        flush_buffer_cache(**flush_args, host=args.host, port=args.port)
 
         conn = create_connection(
             db_name=db_name,

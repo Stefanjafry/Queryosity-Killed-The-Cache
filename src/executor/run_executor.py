@@ -46,46 +46,109 @@ from src.utilities.workload import load_queries
 from src.visualization.serializers import dump_executor_data
 
 
-def flush_buffer_cache(container_name: str) -> None:
+def flush_buffer_cache(
+    container_name: str | None = None,
+    *,
+    flush_cmd: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 5432,
+) -> None:
     """
-    Flush the PostgreSQL buffer cache by restarting the Docker container.
+    Flush PostgreSQL shared buffers by restarting the server.
 
-    This clears both PostgreSQL shared buffers and the OS page cache
-    inside the container, ensuring a cold-start state for the next run.
+    Exactly one of *container_name* or *flush_cmd* must be supplied:
+
+    * ``container_name`` -- legacy Docker setup; runs
+      ``docker restart <name>``.
+    * ``flush_cmd`` -- arbitrary shell command for non-Docker setups,
+      e.g. ``"sudo systemctl restart postgresql-16"`` on a native
+      install.
+
+    Either approach clears PostgreSQL's shared_buffers (the postgres
+    process restarts).  Neither approach clears the host OS page cache;
+    this is the same behaviour the original Docker-based path had, so
+    wall-clock numbers remain comparable between setups.
+
+    After running the restart command, blocks until the server again
+    accepts a TCP connection on *host*:*port*.
 
     Parameters
     ----------
-    container_name : str
-        Name of the Docker container running PostgreSQL.
+    container_name : str | None
+        Docker container name (legacy path).  Mutually exclusive with
+        ``flush_cmd``.
+    flush_cmd : str | None
+        Shell command for non-Docker setups.  Mutually exclusive with
+        ``container_name``.
+    host : str
+        Host to probe while waiting for the server to come back.
+    port : int
+        Port to probe while waiting for the server to come back.
 
     Raises
     ------
+    ValueError
+        If neither or both of ``container_name`` and ``flush_cmd`` are
+        given.
     RuntimeError
-        If the container fails to restart.
+        If the restart command fails or the server does not become
+        ready within the wait timeout.
     """
-    print(f"  Flushing buffer cache (restarting container '{container_name}')…")
-    result = subprocess.run(
-        ["docker", "restart", container_name],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to restart container '{container_name}': {result.stderr.strip()}"
+    if (container_name is None) == (flush_cmd is None):
+        raise ValueError(
+            "flush_buffer_cache: pass exactly one of "
+            "container_name or flush_cmd"
         )
 
-    _wait_for_pg(container_name)
+    if container_name is not None:
+        print(f"  Flushing buffer cache (docker restart {container_name})…")
+        result = subprocess.run(
+            ["docker", "restart", container_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to restart container '{container_name}': "
+                f"{result.stderr.strip()}"
+            )
+    else:
+        assert flush_cmd is not None  # narrowing for type checker
+        print(f"  Flushing buffer cache ({flush_cmd})…")
+        result = subprocess.run(
+            flush_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"Flush command failed (rc={result.returncode}): {err}"
+            )
+
+    _wait_for_pg(host=host, port=port)
     print("  Buffer cache flushed — PostgreSQL is ready.")
 
 
-def _wait_for_pg(container_name: str, timeout_s: int = 30) -> None:
+def _wait_for_pg(
+    host: str = "127.0.0.1",
+    port: int = 5432,
+    timeout_s: int = 30,
+) -> None:
     """
-    Block until PostgreSQL inside the container accepts connections.
+    Block until PostgreSQL accepts a TCP connection on *host*:*port*.
+
+    Probes via psycopg rather than ``pg_isready`` so we do not depend
+    on the libpq client binary being on PATH (it is not, by default,
+    on PGDG RHEL installs).
 
     Parameters
     ----------
-    container_name : str
-        Name of the Docker container running PostgreSQL.
+    host : str
+        Host to probe.
+    port : int
+        Port to probe.
     timeout_s : int
         Maximum seconds to wait before raising.
 
@@ -94,17 +157,28 @@ def _wait_for_pg(container_name: str, timeout_s: int = 30) -> None:
     RuntimeError
         If PostgreSQL does not become ready within the timeout.
     """
+    import psycopg  # local import to avoid a hard dep at module load
+
     deadline = time.monotonic() + timeout_s
+    last_exc: Exception | None = None
     while time.monotonic() < deadline:
-        probe = subprocess.run(
-            ["docker", "exec", container_name, "pg_isready", "-U", "postgres"],
-            capture_output=True,
-        )
-        if probe.returncode == 0:
+        try:
+            conn = psycopg.connect(
+                host=host,
+                port=port,
+                dbname="postgres",
+                user="postgres",
+                password="postgres",
+                connect_timeout=2,
+            )
+            conn.close()
             return
-        time.sleep(1)
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.5)
     raise RuntimeError(
-        f"PostgreSQL in '{container_name}' did not become ready within {timeout_s}s"
+        f"PostgreSQL at {host}:{port} did not become ready within "
+        f"{timeout_s}s (last error: {last_exc})"
     )
 
 
@@ -170,7 +244,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--container",
         default=PG_CONTAINER_NAME,
-        help=f"Docker container name for cache flushing (default: {PG_CONTAINER_NAME})",
+        help=f"Docker container name for cache flushing (default: {PG_CONTAINER_NAME}). "
+             "Ignored when --flush-cmd is given.",
+    )
+    parser.add_argument(
+        "--flush-cmd",
+        default=None,
+        help="Shell command to run to flush the buffer cache (e.g. "
+             "'sudo systemctl restart postgresql-16' for native installs). "
+             "If omitted, falls back to 'docker restart <--container>'.",
     )
     parser.add_argument("--host", default=PG_HOST)
     parser.add_argument("--port", type=int, default=PG_PORT)
@@ -201,7 +283,10 @@ def main(argv: list[str] | None = None) -> None:
         rng = random.Random(BASELINE_SEED)
         random_order = list(query_ids)
         rng.shuffle(random_order)
-        flush_buffer_cache(args.container)
+        if args.flush_cmd:
+            flush_buffer_cache(flush_cmd=args.flush_cmd, host=args.host, port=args.port)
+        else:
+            flush_buffer_cache(container_name=args.container, host=args.host, port=args.port)
         print(f"\nConnecting to database '{db_name}' at {args.host}:{args.port}…")
         conn = _connect(args, db_name)
         try:
@@ -212,7 +297,10 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             close_connection(conn)
 
-    flush_buffer_cache(args.container)
+    if args.flush_cmd:
+        flush_buffer_cache(flush_cmd=args.flush_cmd, host=args.host, port=args.port)
+    else:
+        flush_buffer_cache(container_name=args.container, host=args.host, port=args.port)
     print(f"\nConnecting to database '{db_name}' at {args.host}:{args.port}…")
     conn = _connect(args, db_name)
     try:
