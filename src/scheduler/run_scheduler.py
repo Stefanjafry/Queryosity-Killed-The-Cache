@@ -187,6 +187,14 @@ def main(argv: list[str] | None = None) -> None:
              "directional matrix as an extra baseline. Requires "
              "page-level data; computes the directional matrix once.",
     )
+    parser.add_argument(
+        "--page-access-dir",
+        default=None,
+        help="Directory of per-query page-access CSVs.  Defaults to "
+             "page_access/<workload>/.  Use a per-cache-size directory "
+             "(e.g. page_access/tpch_sb800mb) so the simulator's "
+             "residue sets match the cache capacity it is simulating.",
+    )
     parser.add_argument("--host", default=PG_HOST)
     parser.add_argument("--port", type=int, default=PG_PORT)
     parser.add_argument("--user", default=PG_USER)
@@ -231,7 +239,10 @@ def main(argv: list[str] | None = None) -> None:
         close_connection(conn)
 
     # Load page-level access data if available
-    page_access_dir = PROJECT_ROOT / "page_access" / args.workload
+    if args.page_access_dir is not None:
+        page_access_dir = Path(args.page_access_dir)
+    else:
+        page_access_dir = PROJECT_ROOT / "page_access" / args.workload
     page_sets: list[frozenset[int]] | None = None
 
     if page_access_dir.is_dir() and any(page_access_dir.glob("*.csv")):

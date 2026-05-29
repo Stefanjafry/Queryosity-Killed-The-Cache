@@ -196,7 +196,8 @@ def main(argv: list[str] | None = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Accumulate per-(schedule, rep) totals for the end-of-run summary.
-    totals: dict[str, list[tuple[float, int, int]]] = {k: [] for k in schedules}
+    # Per-rep tuples: (total_elapsed_ms, total_hits, total_reads, per_query_avg_hit_ratio)
+    totals: dict[str, list[tuple[float, int, int, float]]] = {k: [] for k in schedules}
 
     print(
         f"\nWall-clock sweep: workload={args.workload}  cache={cache_label}  "
@@ -256,52 +257,71 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 f.flush()  # persist after every rep so a crash loses at most one rep
 
+                # Per-query average hit ratio: mean over queries of
+                # (hits / (hits+reads)).  This matches the paper's
+                # "Average Cache Hit Ratio" metric and complements the
+                # aggregate ratio (total hits / total blocks).
+                per_q_ratios = [qr.hit_ratio for qr in result.query_results]
+                per_q_avg_hit = (
+                    sum(per_q_ratios) / len(per_q_ratios)
+                    if per_q_ratios
+                    else 0.0
+                )
+
                 totals[label].append(
                     (
                         result.total_elapsed_ms,
                         result.total_shared_hit_blocks,
                         result.total_shared_read_blocks,
+                        per_q_avg_hit,
                     )
                 )
                 print(
                     f"    total_time={result.total_elapsed_ms:,.1f} ms  "
                     f"hits={result.total_shared_hit_blocks:,}  "
                     f"reads={result.total_shared_read_blocks:,}  "
-                    f"hit%={result.hit_ratio * 100:.2f}\n"
+                    f"hit%(agg)={result.hit_ratio * 100:.2f}  "
+                    f"hit%(per-q)={per_q_avg_hit * 100:.2f}\n"
                 )
 
     # ---- Summary table ----
     print(f"\nWrote {out_path}")
-    print(f"\n{'=' * 72}")
-    print(f"SUMMARY  (workload={args.workload}, cache={cache_label}, {os_cache_tag})")
-    print(f"{'=' * 72}")
+    print(f"\n{'=' * 88}")
+    print(
+        f"SUMMARY  (workload={args.workload}, cache={cache_label}, {os_cache_tag})"
+    )
+    print(f"{'=' * 88}")
     print(
         f"{'schedule':<10} {'time_ms mean':>14} {'time_ms std':>12} "
-        f"{'reads mean':>12} {'hit% mean':>10}"
+        f"{'reads mean':>12} {'hit% agg':>10} {'hit% per-q':>11}"
     )
-    print("-" * 72)
+    print("-" * 88)
     for label in schedules:
         runs = totals[label]
-        times = [t for t, _, _ in runs]
-        reads = [r for _, _, r in runs]
-        hits = [h for _, h, _ in runs]
-        hit_pcts = [
+        times = [t for t, _, _, _ in runs]
+        reads = [r for _, _, r, _ in runs]
+        hit_pcts_agg = [
             100.0 * h / (h + r) if (h + r) else 0.0
-            for (_, h, r) in runs
+            for (_, h, r, _) in runs
         ]
+        hit_pcts_per_q = [100.0 * pq for (_, _, _, pq) in runs]
         t_mean = statistics.mean(times)
         t_std = statistics.stdev(times) if len(times) > 1 else 0.0
         r_mean = statistics.mean(reads)
-        hp_mean = statistics.mean(hit_pcts)
+        hp_agg_mean = statistics.mean(hit_pcts_agg)
+        hp_perq_mean = statistics.mean(hit_pcts_per_q)
         print(
             f"{label:<10} {t_mean:>14,.1f} {t_std:>12,.1f} "
-            f"{r_mean:>12,.0f} {hp_mean:>9.2f}%"
+            f"{r_mean:>12,.0f} {hp_agg_mean:>9.2f}% {hp_perq_mean:>10.2f}%"
         )
-    print("-" * 72)
+    print("-" * 88)
     print(
-        "Note: 'reads' = shared_read_blocks (shared_buffers misses). With a "
-        "warm OS\ncache these are largely served from RAM, not disk. Compare "
-        "against the\n--drop-os-cache pass for the true cold-disk picture."
+        "Note: 'hit% agg' = Σ hits / Σ blocks across all queries; "
+        "'hit% per-q' = mean of\nper-query hit ratios (matches the paper's "
+        "'Average Cache Hit Ratio' metric).  'reads'\n= shared_read_blocks "
+        "(shared_buffers misses).  With a warm OS cache these are largely\n"
+        "served from RAM, not disk.  Compare against the --drop-os-cache "
+        "pass for the\ntrue cold-disk picture."
     )
 
 

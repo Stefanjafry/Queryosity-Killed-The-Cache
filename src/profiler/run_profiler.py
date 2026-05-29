@@ -1,9 +1,23 @@
 """
 Profile all queries in a workload by capturing page-level buffer cache access.
 
-Each query is run from a cold cache (buffer cache flushed via Docker restart),
-then pg_buffercache is inspected to record exactly which pages were loaded.
-Results are saved as CSV files in page_access/<workload>/.
+Each query is run from a cold cache (buffer cache flushed via Docker
+restart or ``--flush-cmd``), then ``pg_buffercache`` is inspected to
+record exactly which pages were loaded.  Results are saved as CSV files
+in ``page_access/<workload>/`` by default; pass ``--output-dir`` to send
+them elsewhere — e.g. one directory per simulated cache size when
+calibrating the directional matrix at multiple buffer capacities:
+
+    SET shared_buffers='800MB';  -- restart Postgres
+    python -m src.profiler.run_profiler \\
+        --workload tpch \\
+        --output-dir page_access/tpch_sb800mb \\
+        --flush-cmd "sudo systemctl restart postgresql-16"
+
+Then point ``src.scheduler.run_scheduler`` at the matching directory via
+``--page-access-dir page_access/tpch_sb800mb`` so the simulator sees
+residue sets captured at the cache size it is about to simulate, rather
+than residues filtered through a different (larger) cache.
 
 Usage
 -----
@@ -47,6 +61,15 @@ def main(argv: list[str] | None = None) -> None:
         help="Query workload to profile (default: tpch)",
     )
     parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write per-query CSVs into.  Defaults to "
+             "page_access/<workload>/.  Use a per-cache-size directory "
+             "(e.g. page_access/tpch_sb800mb) when re-profiling at a "
+             "non-default shared_buffers so the simulator can match the "
+             "regime it is going to simulate.",
+    )
+    parser.add_argument(
         "--container",
         default=PG_CONTAINER_NAME,
         help=f"Docker container name (default: {PG_CONTAINER_NAME}). "
@@ -68,7 +91,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     db_name = DB_DEFAULTS[args.workload]
-    output_dir = PROJECT_ROOT / "page_access" / args.workload
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else PROJECT_ROOT / "page_access" / args.workload
+    )
 
     print(f"Loading {args.workload} queries…")
     queries = load_queries(args.workload)
@@ -95,7 +122,7 @@ def main(argv: list[str] | None = None) -> None:
 
     t_total = time.perf_counter()
 
-    for i, (query_id, sql) in enumerate(queries.items(), 1):
+    for i, (query_id, query_sql) in enumerate(queries.items(), 1):
         print(f"\n[{i}/{len(queries)}] Profiling {query_id}…")
 
         flush_args = (
@@ -116,7 +143,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         try:
-            pages = profile_query(query_id, sql, conn)
+            pages = profile_query(query_id, query_sql, conn)
             path = save_page_access(query_id, pages, output_dir)
             print(f"    Saved to {path}")
         except Exception as exc:

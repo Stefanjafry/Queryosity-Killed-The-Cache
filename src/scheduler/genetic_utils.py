@@ -311,10 +311,18 @@ class Individual:
         """
         Produce an offspring by crossing this individual with another.
 
-        With probability config.crossover_rate, applies order crossover
-        between the two parents, then applies swap mutation with
-        probability config.mutation_rate. If crossover is not applied,
-        returns a clone of self with possible mutation.
+        With probability ``config.crossover_rate``, applies order
+        crossover between the two parents, then applies swap mutation
+        with probability ``config.mutation_rate``.  If crossover is not
+        applied, returns a clone of self with possible mutation.
+
+        The crossover branch bypasses ``clone`` and builds the offspring
+        via a direct shallow copy so that the mutation probability is
+        sampled *once* per child rather than twice (``clone`` would
+        otherwise sample-and-discard a mutation that the explicit
+        post-crossover mutation step overwrites).  This keeps the RNG
+        sequence consumed per offspring constant across the crossover
+        and non-crossover branches.
 
         Parameters
         ----------
@@ -330,11 +338,14 @@ class Individual:
             new_schedule = _order_crossover(
                 self.schedule,
                 other.schedule,
-                rng=self._rng
+                rng=self._rng,
             )
-            new = self.clone()
-            new._fitness = None
+            # Shallow-copy this individual to inherit profiles, config,
+            # rng, and (for subclasses) the precomputed matrices /
+            # reusable sets — all of which are shared, read-only state.
+            new = copy.copy(self)
             new.schedule = new_schedule
+            new._fitness = None
             if new._rng.random() < new._config.mutation_rate:
                 _swap_mutation(new.schedule, new._rng)
         else:
@@ -434,26 +445,33 @@ class IndividualDirectional(Individual):
     the symmetric overlap matrix misses.  The final best schedule is
     always re-scored by the exact clock-sweep simulator in run_ga.
 
+    Carries the *page-level* directional reusable sets — not just the
+    scalar matrix — so the windowed fitness can apply exact duplicate-
+    page discounting across all in-window predecessors.
+
     Attributes
     ----------
-    directional_matrix : list[list[int]]
-        Asymmetric pairwise directional matrix from
-        ``compute_directional_matrix``.  Must be built with the same
-        cache capacity used by the simulator.
+    reusable_sets : list[list[frozenset[int]]]
+        Per-edge directional reusable page sets from
+        ``compute_directional_reusable_sets``.  Must be built with the
+        same cache capacity used by the simulator.
     page_counts : list[int]
-        Number of distinct pages per query, same indexing as directional_matrix.
+        Number of distinct pages per query, same indexing as
+        ``reusable_sets``.
     """
 
-    directional_matrix: list[list[int]]
+    reusable_sets: list[list[frozenset[int]]]
     page_counts: list[int]
 
     def fitness(self) -> float:
         """
-        Return the directional approximate fitness of this individual.
+        Return the windowed directional approximate fitness of this individual.
 
-        Evaluates and caches the fitness on the first call as the
-        edge-local sum ``Σ D[π(k-1)][π(k)]`` divided by total page
-        requests.  Subsequent calls return the cached value.
+        Evaluates and caches the fitness on the first call by walking
+        each query's window of valid predecessors and accumulating
+        page-level directional reusable contributions with exact
+        already-counted discounting.  Subsequent calls return the
+        cached value.
 
         Returns
         -------
@@ -462,9 +480,10 @@ class IndividualDirectional(Individual):
         """
         if self._fitness is None:
             self._fitness = approximate_schedule_fitness_directional(
-                self.directional_matrix,
+                self.reusable_sets,
                 self.page_counts,
                 self.schedule,
+                self.cache_capacity_pages,
             )
         return self._fitness
 
@@ -478,7 +497,7 @@ def make_individual(
     page_sets: Optional[list[frozenset[int]]],
     overlap_matrix: Optional[list[list[int]]] = None,
     page_counts: Optional[list[int]] = None,
-    directional_matrix: Optional[list[list[int]]] = None,
+    reusable_sets: Optional[list[list[frozenset[int]]]] = None,
 ) -> Individual:
     """
     Construct the appropriate Individual subtype for the configured fitness mode.
@@ -490,7 +509,7 @@ def make_individual(
     Dispatch rules:
     * When ``config.use_approximate_fitness`` is True, ``fitness_type``
       is ``"lru"``, ``config.approx_mode == "directional"``, and page-level
-      data (``page_sets``, ``directional_matrix``, ``page_counts``) is
+      data (``page_sets``, ``reusable_sets``, ``page_counts``) is
       provided, returns an ``IndividualDirectional``.
     * Else when ``config.use_approximate_fitness`` is True, ``fitness_type``
       is ``"lru"``, and page-level data (``page_sets``, ``overlap_matrix``,
@@ -520,8 +539,8 @@ def make_individual(
     page_counts : list[int] or None
         Per-query page counts.  Required when
         ``config.use_approximate_fitness`` is True.
-    directional_matrix : list[list[int]] or None
-        Precomputed directional utility matrix.  Required when
+    reusable_sets : list[list[frozenset[int]]] or None
+        Precomputed directional reusable page sets.  Required when
         ``config.use_approximate_fitness`` is True and
         ``config.approx_mode == "directional"``.
 
@@ -553,7 +572,7 @@ def make_individual(
         and config.use_approximate_fitness
         and config.approx_mode == "directional"
         and page_sets is not None
-        and directional_matrix is not None
+        and reusable_sets is not None
         and page_counts is not None
     ):
         return IndividualDirectional(
@@ -563,7 +582,7 @@ def make_individual(
             _rng=rng,
             _config=config,
             _fitness_fn=fitness_fn,
-            directional_matrix=directional_matrix,
+            reusable_sets=reusable_sets,
             page_counts=page_counts,
         )
 

@@ -18,6 +18,8 @@ from psycopg import Connection
 
 logger = logging.getLogger(__name__)
 
+from psycopg.sql import SQL
+
 BUFFERCACHE_QUERY = """
 SELECT c.relname, b.relblocknumber
 FROM pg_buffercache b
@@ -31,7 +33,7 @@ ORDER BY c.relname, b.relblocknumber;
 
 def profile_query(
     query_id: str,
-    sql: str,
+    query: SQL,
     connection: Connection,
 ) -> list[tuple[str, int]]:
     """
@@ -44,8 +46,12 @@ def profile_query(
     ----------
     query_id : str
         Identifier for the query.
-    sql : str
-        SQL text to execute.
+    query : psycopg.sql.SQL
+        SQL statement to execute, as a psycopg ``Composable`` so that
+        the EXPLAIN wrapper is built via ``SQL.format`` and any nested
+        composition is preserved.  Passing a raw ``str`` here would
+        bypass psycopg's escaping and serialise composed identifiers as
+        their template literals (a silent footgun).
     connection : Connection
         Active PostgreSQL connection.
 
@@ -56,8 +62,11 @@ def profile_query(
         after executing the query.
     """
     t0 = time.perf_counter()
+    explain_stmt = SQL("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {q}").format(
+        q=query,
+    )
     with connection.cursor() as cur:
-        cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")
+        cur.execute(explain_stmt)
         cur.fetchone()
     elapsed = time.perf_counter() - t0
     print(f"    Query executed in {elapsed:.1f}s")

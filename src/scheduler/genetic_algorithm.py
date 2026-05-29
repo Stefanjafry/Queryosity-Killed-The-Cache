@@ -30,7 +30,7 @@ from src.scheduler.genetic_utils import (
 from src.simulator.access_profile import AccessProfile
 from src.simulator.cache_simulator import (
     SimulationResult,
-    compute_directional_matrix,
+    compute_directional_reusable_sets,
     compute_overlap_matrix,
     simulate_schedule,
     simulate_schedule_page_level,
@@ -158,16 +158,16 @@ def run_ga(
         )
 
     # When the approximate-fitness path is active, precompute the
-    # relevant matrix (symmetric overlap or directional utility) and
-    # per-query page counts once up front.  These are shared by every
-    # Individual in the population.
+    # relevant matrix (symmetric overlap or directional reusable sets)
+    # and per-query page counts once up front.  These are shared by
+    # every Individual in the population.
     overlap_matrix: list[list[int]] | None = None
-    directional_matrix: list[list[int]] | None = None
+    reusable_sets: list[list[frozenset[int]]] | None = None
     page_counts: list[int] | None = None
     if config.use_approximate_fitness and page_sets is not None:
         page_counts = [len(ps) for ps in page_sets]
         if config.approx_mode == "directional":
-            directional_matrix = compute_directional_matrix(
+            reusable_sets = compute_directional_reusable_sets(
                 page_sets, cache_capacity_pages,
             )
         else:
@@ -187,7 +187,7 @@ def run_ga(
                 page_sets=page_sets,
                 overlap_matrix=overlap_matrix,
                 page_counts=page_counts,
-                directional_matrix=directional_matrix,
+                reusable_sets=reusable_sets,
             )
         )
 

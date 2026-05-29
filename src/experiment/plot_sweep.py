@@ -189,18 +189,60 @@ def main(argv: list[str] | None = None) -> None:
     fig.savefig(p3, dpi=150)
     plt.close(fig)
 
-    # ---- Figure 4: hit ratio ----
-    hit_pct = []
+    # ---- Figure 4: hit ratio (aggregate AND per-query mean) ----
+    # Aggregate hit ratio: Σ hits / Σ (hits + reads) across the whole
+    # workload.  Per-query mean: average over queries of each query's
+    # individual hit ratio.  The paper reports the latter as "Average
+    # Cache Hit Ratio"; we show both so the comparison against the
+    # paper is unambiguous.
+    hit_pct_agg: list[float] = []
+    hit_pct_perq: list[float] = []
     for s in schedules:
         h = sum(agg[s]["hits"])
         r = sum(agg[s]["reads"])
-        hit_pct.append(100.0 * h / (h + r) if (h + r) else 0.0)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.bar(x, hit_pct, color=[colors.get(s, "#777") for s in schedules])
-    ax.set_xticks(list(x))
+        hit_pct_agg.append(100.0 * h / (h + r) if (h + r) else 0.0)
+        # Per-query average over per-query rows of this schedule (any
+        # rep).  Compute by recomputing from the raw rows so we use
+        # exactly the same definition as run_sweep.
+        per_q_ratios = []
+        for r_row in rows:
+            if r_row["schedule"] != s or int(r_row["position"]) == 0:
+                continue
+            hh = int(r_row["shared_hit_blocks"])
+            rr = int(r_row["shared_read_blocks"])
+            if hh + rr > 0:
+                per_q_ratios.append(100.0 * hh / (hh + rr))
+            else:
+                per_q_ratios.append(0.0)
+        hit_pct_perq.append(
+            sum(per_q_ratios) / len(per_q_ratios)
+            if per_q_ratios
+            else 0.0
+        )
+
+    width = 0.4
+    xs = list(x)
+    xs_agg = [v - width / 2 for v in xs]
+    xs_perq = [v + width / 2 for v in xs]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(
+        xs_agg, hit_pct_agg, width,
+        label="Aggregate (Σ hits / Σ blocks)",
+        color=[colors.get(s, "#777") for s in schedules],
+        edgecolor="black",
+    )
+    ax.bar(
+        xs_perq, hit_pct_perq, width,
+        label="Per-query mean (paper's metric)",
+        color=[colors.get(s, "#777") for s in schedules],
+        hatch="//",
+        edgecolor="black",
+    )
+    ax.set_xticks(xs)
     ax.set_xticklabels(labels)
-    ax.set_ylabel("Overall shared-buffer hit ratio (%)")
+    ax.set_ylabel("Shared-buffer hit ratio (%)")
     ax.set_title(f"Hit ratio — {tag}")
+    ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     p4 = f"{args.out_prefix}_hit_ratio.png"
