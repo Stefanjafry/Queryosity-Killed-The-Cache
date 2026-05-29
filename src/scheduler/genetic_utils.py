@@ -442,25 +442,25 @@ class IndividualDirectional(Individual):
     Used during GA evolution when ``config.approx_mode == "directional"``.
     The directional matrix ``D[i][j] = |R(Qᵢ; C) ∩ P(Qⱼ)|`` captures
     the asymmetry between large→small and small→large transitions that
-    the symmetric overlap matrix misses.  The final best schedule is
-    always re-scored by the exact clock-sweep simulator in run_ga.
-
-    Carries the *page-level* directional reusable sets — not just the
-    scalar matrix — so the windowed fitness can apply exact duplicate-
-    page discounting across all in-window predecessors.
+    the symmetric overlap matrix misses.  Fitness is computed by the
+    windowed scalar variant of the approximate fitness — same window
+    structure as the symmetric variant, same independence-estimate
+    discount style, just driven by the directional matrix.  The final
+    best schedule is always re-scored by the exact clock-sweep
+    simulator in run_ga.
 
     Attributes
     ----------
-    reusable_sets : list[list[frozenset[int]]]
-        Per-edge directional reusable page sets from
-        ``compute_directional_reusable_sets``.  Must be built with the
-        same cache capacity used by the simulator.
+    directional_matrix : list[list[int]]
+        Asymmetric pairwise directional matrix from
+        ``compute_directional_matrix``.  Must be built with the same
+        cache capacity used by the simulator.
     page_counts : list[int]
         Number of distinct pages per query, same indexing as
-        ``reusable_sets``.
+        ``directional_matrix``.
     """
 
-    reusable_sets: list[list[frozenset[int]]]
+    directional_matrix: list[list[int]]
     page_counts: list[int]
 
     def fitness(self) -> float:
@@ -469,9 +469,8 @@ class IndividualDirectional(Individual):
 
         Evaluates and caches the fitness on the first call by walking
         each query's window of valid predecessors and accumulating
-        page-level directional reusable contributions with exact
-        already-counted discounting.  Subsequent calls return the
-        cached value.
+        scalar directional contributions with an independence-estimate
+        discount.  Subsequent calls return the cached value.
 
         Returns
         -------
@@ -480,7 +479,7 @@ class IndividualDirectional(Individual):
         """
         if self._fitness is None:
             self._fitness = approximate_schedule_fitness_directional(
-                self.reusable_sets,
+                self.directional_matrix,
                 self.page_counts,
                 self.schedule,
                 self.cache_capacity_pages,
@@ -497,7 +496,7 @@ def make_individual(
     page_sets: Optional[list[frozenset[int]]],
     overlap_matrix: Optional[list[list[int]]] = None,
     page_counts: Optional[list[int]] = None,
-    reusable_sets: Optional[list[list[frozenset[int]]]] = None,
+    directional_matrix: Optional[list[list[int]]] = None,
 ) -> Individual:
     """
     Construct the appropriate Individual subtype for the configured fitness mode.
@@ -509,7 +508,7 @@ def make_individual(
     Dispatch rules:
     * When ``config.use_approximate_fitness`` is True, ``fitness_type``
       is ``"lru"``, ``config.approx_mode == "directional"``, and page-level
-      data (``page_sets``, ``reusable_sets``, ``page_counts``) is
+      data (``page_sets``, ``directional_matrix``, ``page_counts``) is
       provided, returns an ``IndividualDirectional``.
     * Else when ``config.use_approximate_fitness`` is True, ``fitness_type``
       is ``"lru"``, and page-level data (``page_sets``, ``overlap_matrix``,
@@ -539,8 +538,8 @@ def make_individual(
     page_counts : list[int] or None
         Per-query page counts.  Required when
         ``config.use_approximate_fitness`` is True.
-    reusable_sets : list[list[frozenset[int]]] or None
-        Precomputed directional reusable page sets.  Required when
+    directional_matrix : list[list[int]] or None
+        Precomputed directional utility matrix.  Required when
         ``config.use_approximate_fitness`` is True and
         ``config.approx_mode == "directional"``.
 
@@ -572,7 +571,7 @@ def make_individual(
         and config.use_approximate_fitness
         and config.approx_mode == "directional"
         and page_sets is not None
-        and reusable_sets is not None
+        and directional_matrix is not None
         and page_counts is not None
     ):
         return IndividualDirectional(
@@ -582,7 +581,7 @@ def make_individual(
             _rng=rng,
             _config=config,
             _fitness_fn=fitness_fn,
-            reusable_sets=reusable_sets,
+            directional_matrix=directional_matrix,
             page_counts=page_counts,
         )
 

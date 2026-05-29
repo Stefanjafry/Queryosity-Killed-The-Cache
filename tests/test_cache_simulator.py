@@ -390,11 +390,9 @@ class TestApproximateScheduleFitnessDirectional:
     def test_single_query(self):
         # No predecessor => no hits estimated.
         page_sets = [frozenset({0, 1, 2})]
-        reusable = compute_directional_reusable_sets(
-            page_sets, cache_capacity_pages=10,
-        )
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=10)
         f = approximate_schedule_fitness_directional(
-            reusable, [3], [0], cache_capacity_pages=10,
+            D, [3], [0], cache_capacity_pages=10,
         )
         assert f == 0.0
 
@@ -403,14 +401,12 @@ class TestApproximateScheduleFitnessDirectional:
             frozenset({0, 1, 2}),
             frozenset({1, 2, 3}),
         ]
-        # No eviction pressure, so reusable[0][1] = {1, 2}, |.| = 2.
-        reusable = compute_directional_reusable_sets(
-            page_sets, cache_capacity_pages=100,
-        )
+        # No eviction pressure, so D[0][1] = |{0,1,2} ∩ {1,2,3}| = 2.
+        D = compute_directional_matrix(page_sets, cache_capacity_pages=100)
         page_counts = [3, 3]
         # Schedule q0 then q1: 2 estimated hits out of 6 page requests.
         f = approximate_schedule_fitness_directional(
-            reusable, page_counts, [0, 1], cache_capacity_pages=100,
+            D, page_counts, [0, 1], cache_capacity_pages=100,
         )
         assert abs(f - 2 / 6) < 1e-9
 
@@ -423,15 +419,15 @@ class TestApproximateScheduleFitnessDirectional:
         Sq = frozenset({0, 1, 2, 3, 4})
         page_sets = [Lq, Sq]
         capacity = 10
-        reusable = compute_directional_reusable_sets(
+        D = compute_directional_matrix(
             page_sets, cache_capacity_pages=capacity,
         )
         page_counts = [len(ps) for ps in page_sets]
         fit_L_first = approximate_schedule_fitness_directional(
-            reusable, page_counts, [0, 1], cache_capacity_pages=capacity,
+            D, page_counts, [0, 1], cache_capacity_pages=capacity,
         )
         fit_S_first = approximate_schedule_fitness_directional(
-            reusable, page_counts, [1, 0], cache_capacity_pages=capacity,
+            D, page_counts, [1, 0], cache_capacity_pages=capacity,
         )
         assert fit_S_first > fit_L_first
 
@@ -441,48 +437,56 @@ class TestApproximateScheduleFitnessDirectional:
         # Q2 needs pages {0, 1, 2, 3} — none in Q1's residue, all in
         # Q0's residue.
         # A single-step fitness would credit Q2 with 0 hits (since
-        # |residue(Q1) ∩ pages(Q2)| = 0).  The windowed fitness must
-        # walk past Q1 and credit all 4 from Q0, because the cache
-        # budget at C=10 easily holds both Q0 and Q1.
+        # D[Q1][Q2] = 0).  The windowed fitness must walk past Q1 and
+        # credit all 4 from Q0, because the cache budget at C=10 easily
+        # holds both Q0 and Q1.
         page_sets = [
             frozenset({0, 1, 2, 3}),
             frozenset({10, 11}),
             frozenset({0, 1, 2, 3}),
         ]
         capacity = 10
-        reusable = compute_directional_reusable_sets(
+        D = compute_directional_matrix(
             page_sets, cache_capacity_pages=capacity,
         )
         page_counts = [len(ps) for ps in page_sets]
         f = approximate_schedule_fitness_directional(
-            reusable, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
+            D, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
         )
         # Total page requests = 4 + 2 + 4 = 10.
-        # Hits: Q1 has none from Q0 ({10,11} ∩ {0,1,2,3} = empty);
-        #       Q2 picks up 4 from Q0 via the window.
-        # So expected fitness = 4 / 10.
+        # Hits: Q1 has none from Q0 (D[0][1] = 0); Q2 picks up 4 from
+        # Q0 via the window (D[0][2] = 4, no other in-window
+        # contribution because D[1][2] = 0 so the discount drops out).
+        # Expected fitness = 4 / 10.
         assert abs(f - 4 / 10) < 1e-9
 
-    def test_windowed_does_not_double_count_pages(self):
-        # Q0 and Q1 both hold pages {0, 1, 2, 3} fully.  Q2 needs the
-        # same pages.  reusable[0][2] = reusable[1][2] = {0,1,2,3}.
-        # The exact set discount must count those four pages exactly
-        # once for Q2 — not eight.
+    def test_windowed_discount_caps_double_count(self):
+        # Q0 and Q1 both deliver pages {0, 1, 2, 3} fully to Q2.  With
+        # capacity 100 everything fits.
+        # D[0][1] = D[0][2] = D[1][2] = 4.  page_counts = [4, 4, 4].
+        # For Q2 with q-capacity 4:
+        #   - prev=Q1: incremental=4, discount=0, contributes 4.
+        #     counted_d_sum becomes 4.
+        #   - prev=Q0: incremental=4, discount = 4 * 4 / 4 = 4,
+        #     contributes max(0, 4-4) = 0.
+        # So Q2 total hits = 4, not 8.  This is the independence-
+        # estimate discount preventing double-counting of pages that
+        # multiple predecessors deliver.
         page_sets = [
             frozenset({0, 1, 2, 3}),
             frozenset({0, 1, 2, 3}),
             frozenset({0, 1, 2, 3}),
         ]
-        capacity = 100  # everything fits
-        reusable = compute_directional_reusable_sets(
+        capacity = 100
+        D = compute_directional_matrix(
             page_sets, cache_capacity_pages=capacity,
         )
         page_counts = [len(ps) for ps in page_sets]
         f = approximate_schedule_fitness_directional(
-            reusable, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
+            D, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
         )
-        # Q1 picks up 4 hits from Q0; Q2 picks up 4 hits (not 8) from
-        # the window {Q1, Q0}.  Total hits = 8.  Total requests = 12.
+        # Q1 picks up 4 hits from Q0; Q2 picks up 4 hits (not 8) due to
+        # the discount.  Total hits = 8.  Total requests = 12.
         assert abs(f - 8 / 12) < 1e-9
 
 

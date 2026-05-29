@@ -532,9 +532,16 @@ def compute_directional_matrix(
     edge weights in an Asymmetric TSP formulation of the scheduling
     problem.
 
-    Implemented as the per-entry cardinality of
-    ``compute_directional_reusable_sets`` so the two helpers share the
-    same residual computation and remain numerically consistent.
+    Computes residuals once per query, then takes set-intersection
+    cardinalities pairwise.  Does *not* materialise the per-edge
+    intersection sets; ``compute_directional_reusable_sets`` exists
+    separately for callers that need the page IDs themselves (e.g.
+    page-level analyses or alternative fitness functions).
+
+    Complexity
+    ----------
+    O(n) cold-cache runs to build residuals, plus O(n²) set
+    intersections.  Each residual run is one ``batch_access`` call.
 
     Parameters
     ----------
@@ -549,11 +556,20 @@ def compute_directional_matrix(
         Asymmetric *n* x *n* directional utility matrix.  ``D[i][j]``
         and ``D[j][i]`` may differ.
     """
-    reusable = compute_directional_reusable_sets(
-        page_sets, cache_capacity_pages,
-    )
-    n = len(reusable)
-    return [[len(reusable[i][j]) for j in range(n)] for i in range(n)]
+    n = len(page_sets)
+    residuals = [
+        compute_residual(ps, cache_capacity_pages) for ps in page_sets
+    ]
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        res_i = residuals[i]
+        if not res_i:
+            continue
+        for j in range(n):
+            if i == j:
+                continue
+            matrix[i][j] = len(res_i & page_sets[j])
+    return matrix
 
 
 # ---------------------------------------------------------------------------
@@ -690,56 +706,61 @@ def approximate_schedule_fitness(
 
 
 def approximate_schedule_fitness_directional(
-    reusable_sets: list[list[frozenset[int]]],
+    directional_matrix: list[list[int]],
     page_counts: list[int],
     schedule: list[int],
     cache_capacity_pages: int,
 ) -> float:
     """
-    Windowed approximate fitness using directional reusable page sets.
+    Windowed approximate fitness using the directional utility matrix.
 
-    For each position *k* in the schedule, walks backward through prior
-    queries while the budget-driven sliding-window stopping condition
-    holds — the same condition used by
-    ``approximate_schedule_fitness`` for the symmetric variant.  For
-    every predecessor inside the window, accumulates the pages this
-    predecessor would deliver to Qⱼ that have *not yet been delivered*
-    by a later predecessor, i.e.:
+    Mirrors the symmetric windowed fitness exactly in shape — same
+    budget-driven sliding window, same independence-estimate triple-
+    intersection discount — but with the directional matrix as the
+    asymmetric overlap source.  For each query *q* at position *k*,
+    walks backward through predecessors while the budget holds and
+    accumulates expected hits as ``D[prev][q]`` discounted by the
+    estimated overlap with already-counted predecessors.
 
-        new_pages(prev) = reusable_sets[prev][q] \\ already_counted
-        hits_for_q     += |new_pages(prev)|
-        already_counted ∪= new_pages(prev)
+    Discount derivation
+    -------------------
+    The symmetric variant estimates ``|P(prev) ∩ P(cp) ∩ P(q)|`` by
+    conditioning on ``P(cp)`` because it has only the symmetric
+    overlap matrix to work with.  The directional matrix already
+    encodes ``|R(·) ∩ P(q)|``, so the natural analogue is to
+    condition on ``P(q)``:
 
-    Because the discount operates on actual page IDs rather than scalar
-    overlap counts, it is *exact* under the simulator's eviction model:
-    a page is counted at most once per query, regardless of how many
-    in-window predecessors hold it in their residue.  This is the
-    page-level analogue of the symmetric variant's triple-intersection
-    independence estimate — same window structure, same stopping rule,
-    but tighter discount because the directional sets give us the page
-    IDs directly.
+        |R(prev) ∩ R(cp) ∩ P(q)| ≈ |R(prev) ∩ P(q)| · |R(cp) ∩ P(q)| / |P(q)|
+                                = D[prev][q] · D[cp][q] / page_counts[q]
 
-    The hit total per query is capped at ``page_counts[q]`` to avoid
-    overcounting under model error, and the function early-exits the
-    backward walk for that query once the cap is reached.
+    This becomes exact when both residues are subsets of ``P(q)`` and
+    conservative otherwise — the same kind of independence-estimate
+    bound the symmetric variant is built on.
+
+    Because ``D[prev][q]`` and ``page_counts[q]`` are constant in the
+    inner discount loop, the per-predecessor discount factors as
+
+        discount = D[prev][q] / page_counts[q] · Σ_cp D[cp][q]
+
+    and the running sum ``Σ_cp D[cp][q]`` is maintained in O(1) per
+    predecessor.  This collapses what would be an O(w²) discount step
+    to O(w) total per query.
 
     Complexity
     ----------
-    O(n · w · |R̄|), where *w* is the average window depth and |R̄| is
-    the average size of a reusable set.  Strictly slower per call than
-    the original single-step variant but well within the GA's
-    memoised-fitness budget for n ≤ ~100.
+    O(n · w) per call, where *w* is the average window depth.  Strictly
+    scalar arithmetic on precomputed integers — no set operations.
+    Comparable in speed to ``approximate_schedule_fitness``.
 
     Parameters
     ----------
-    reusable_sets : list[list[frozenset[int]]]
-        Precomputed directional reusable page sets from
-        ``compute_directional_reusable_sets``.  Must be built with the
-        same ``cache_capacity_pages`` the schedule will be simulated
-        under.
+    directional_matrix : list[list[int]]
+        Precomputed directional utility matrix from
+        ``compute_directional_matrix``.  Must be built with the same
+        ``cache_capacity_pages`` the schedule will be simulated under.
     page_counts : list[int]
         Number of distinct pages per query (same indexing as
-        *reusable_sets*).
+        *directional_matrix*).
     schedule : list[int]
         Permutation of query indices representing execution order.
     cache_capacity_pages : int
@@ -761,7 +782,7 @@ def approximate_schedule_fitness_directional(
     if total_requests == 0:
         return 0.0
 
-    total_hits = 0
+    total_hits = 0.0
     for k in range(1, n):
         q = schedule[k]
         cap = page_counts[q]
@@ -769,8 +790,12 @@ def approximate_schedule_fitness_directional(
             continue
 
         budget = cache_capacity_pages
-        already_counted: set[int] = set()
-        hits_for_q = 0
+        hits_for_q = 0.0
+        # Running sum Σ D[cp][q] over already-counted predecessors cp.
+        # Lets us compute the discount for the next predecessor in O(1)
+        # by factoring out the cp-independent terms D[prev][q] and
+        # 1/cap.
+        counted_d_sum = 0
 
         for w in range(k - 1, -1, -1):
             prev = schedule[w]
@@ -778,24 +803,16 @@ def approximate_schedule_fitness_directional(
             if budget < 0:
                 break
 
-            delivered = reusable_sets[prev][q]
-            if not delivered:
-                continue
+            d_prev = directional_matrix[prev][q]
+            # discount = d_prev * counted_d_sum / cap
+            #         = d_prev / cap * Σ_cp D[cp][q]
+            discount = d_prev * counted_d_sum / cap
+            hits_for_q += max(0.0, d_prev - discount)
+            counted_d_sum += d_prev
 
-            # Exact page-level discount: subtract pages that have
-            # already been counted from a *later* predecessor (i.e.
-            # one closer in the schedule to q, and therefore more
-            # recent in cache).
-            new_pages = delivered - already_counted
-            if not new_pages:
-                continue
-
-            hits_for_q += len(new_pages)
-            if hits_for_q >= cap:
-                hits_for_q = cap
-                break
-            already_counted |= new_pages
-
+        # Cap at the query's own page count
+        if hits_for_q > cap:
+            hits_for_q = cap
         total_hits += hits_for_q
 
     return total_hits / total_requests
