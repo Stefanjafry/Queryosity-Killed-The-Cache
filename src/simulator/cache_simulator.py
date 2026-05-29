@@ -712,66 +712,50 @@ def approximate_schedule_fitness_directional(
     cache_capacity_pages: int,
 ) -> float:
     """
-    Windowed approximate fitness using the directional utility matrix.
+    Edge-local approximate fitness using the directional utility matrix.
 
-    Mirrors the symmetric windowed fitness exactly in shape — same
-    budget-driven sliding window, same independence-estimate triple-
-    intersection discount — but with the directional matrix as the
-    asymmetric overlap source.  For each query *q* at position *k*,
-    walks backward through predecessors while the budget holds and
-    accumulates expected hits as ``D[prev][q]`` discounted by the
-    estimated overlap with already-counted predecessors.
+    For each position *k* in the schedule, the expected hits for Qⱼ at
+    position *k* are estimated as D[π(k-1)][π(k)] — the pages from
+    the previous query that survived clock-sweep eviction *and* are
+    needed by Qⱼ.  Hits are capped at the query target's own page count.
 
-    Discount derivation
-    -------------------
-    The symmetric variant estimates ``|P(prev) ∩ P(cp) ∩ P(q)|`` by
-    conditioning on ``P(cp)`` because it has only the symmetric
-    overlap matrix to work with.  The directional matrix already
-    encodes ``|R(·) ∩ P(q)|``, so the natural analogue is to
-    condition on ``P(q)``:
+    Single-step is intentional.  The directional signal lives in the
+    per-edge residue computation; a windowed-with-discount wrapper
+    that mirrors the symmetric variant would factor out the row-
+    scaling structure of D on workloads like TPC-H and produce
+    identical rankings to GA+M.  The transitive structure is handled
+    exactly by the clock-sweep simulator that rescores the GA's best
+    schedule at the end of the search.
 
-        |R(prev) ∩ R(cp) ∩ P(q)| ≈ |R(prev) ∩ P(q)| · |R(cp) ∩ P(q)| / |P(q)|
-                                = D[prev][q] · D[cp][q] / page_counts[q]
-
-    This becomes exact when both residues are subsets of ``P(q)`` and
-    conservative otherwise — the same kind of independence-estimate
-    bound the symmetric variant is built on.
-
-    Because ``D[prev][q]`` and ``page_counts[q]`` are constant in the
-    inner discount loop, the per-predecessor discount factors as
-
-        discount = D[prev][q] / page_counts[q] · Σ_cp D[cp][q]
-
-    and the running sum ``Σ_cp D[cp][q]`` is maintained in O(1) per
-    predecessor.  This collapses what would be an O(w²) discount step
-    to O(w) total per query.
+    The cache_capacity_pages parameter is accepted for signature
+    parity with approximate_schedule_fitness and is not used.
 
     Complexity
     ----------
-    O(n · w) per call, where *w* is the average window depth.  Strictly
-    scalar arithmetic on precomputed integers — no set operations.
-    Comparable in speed to ``approximate_schedule_fitness``.
+    O(n) per call, where n is the schedule length.
 
     Parameters
     ----------
     directional_matrix : list[list[int]]
         Precomputed directional utility matrix from
-        ``compute_directional_matrix``.  Must be built with the same
-        ``cache_capacity_pages`` the schedule will be simulated under.
+        compute_directional_matrix.  Must be built with the same
+        cache_capacity_pages the schedule will be simulated under.
     page_counts : list[int]
         Number of distinct pages per query (same indexing as
         *directional_matrix*).
     schedule : list[int]
         Permutation of query indices representing execution order.
     cache_capacity_pages : int
-        Cache capacity in pages, used to bound the look-back window —
-        the same role it plays in the symmetric variant.
+        Unused.  Present so this function shares a signature with
+        approximate_schedule_fitness.
 
     Returns
     -------
     float
         Approximate cache hit ratio in [0.0, 1.0].
     """
+    del cache_capacity_pages  # accepted for signature parity, not used
+
     n = len(schedule)
     if n == 0:
         return 0.0
@@ -782,41 +766,16 @@ def approximate_schedule_fitness_directional(
     if total_requests == 0:
         return 0.0
 
-    total_hits = 0.0
+    total_hits = 0
     for k in range(1, n):
-        q = schedule[k]
-        cap = page_counts[q]
-        if cap == 0:
-            continue
-
-        budget = cache_capacity_pages
-        hits_for_q = 0.0
-        # Running sum Σ D[cp][q] over already-counted predecessors cp.
-        # Lets us compute the discount for the next predecessor in O(1)
-        # by factoring out the cp-independent terms D[prev][q] and
-        # 1/cap.
-        counted_d_sum = 0
-
-        for w in range(k - 1, -1, -1):
-            prev = schedule[w]
-            budget -= page_counts[prev]
-            if budget < 0:
-                break
-
-            d_prev = directional_matrix[prev][q]
-            # discount = d_prev * counted_d_sum / cap
-            #         = d_prev / cap * Σ_cp D[cp][q]
-            discount = d_prev * counted_d_sum / cap
-            hits_for_q += max(0.0, d_prev - discount)
-            counted_d_sum += d_prev
-
-        # Cap at the query's own page count
-        if hits_for_q > cap:
-            hits_for_q = cap
-        total_hits += hits_for_q
+        prev = schedule[k - 1]
+        cur = schedule[k]
+        hits = directional_matrix[prev][cur]
+        if hits > page_counts[cur]:
+            hits = page_counts[cur]
+        total_hits += hits
 
     return total_hits / total_requests
-
 
 # ---------------------------------------------------------------------------
 # Schedule simulation (exact)

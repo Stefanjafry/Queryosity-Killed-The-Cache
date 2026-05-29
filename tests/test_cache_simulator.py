@@ -431,15 +431,16 @@ class TestApproximateScheduleFitnessDirectional:
         )
         assert fit_S_first > fit_L_first
 
-    def test_windowed_credits_non_immediate_predecessor(self):
-        # Q0 brings pages {0, 1, 2, 3} fully into cache.
-        # Q1 brings disjoint pages {10, 11} — small, doesn't evict Q0.
-        # Q2 needs pages {0, 1, 2, 3} — none in Q1's residue, all in
-        # Q0's residue.
-        # A single-step fitness would credit Q2 with 0 hits (since
-        # D[Q1][Q2] = 0).  The windowed fitness must walk past Q1 and
-        # credit all 4 from Q0, because the cache budget at C=10 easily
-        # holds both Q0 and Q1.
+    def test_single_step_only_credits_immediate_predecessor(self):
+        # The single-step formulation credits each query only from its
+        # immediate predecessor.  Q0 brings {0,1,2,3} fully into cache,
+        # Q1 brings disjoint {10,11} (small, no eviction), Q2 needs
+        # {0,1,2,3}.  Q2's credit from D[Q1][Q2] = 0 because R(Q1)
+        # contains no pages needed by Q2.  Earlier predecessors are
+        # *not* walked under single-step — this is the intentional
+        # edge-local nature of the directional fitness.  The clock-
+        # sweep simulator that rescores the GA's best schedule at the
+        # end handles transitive effects exactly.
         page_sets = [
             frozenset({0, 1, 2, 3}),
             frozenset({10, 11}),
@@ -453,41 +454,11 @@ class TestApproximateScheduleFitnessDirectional:
         f = approximate_schedule_fitness_directional(
             D, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
         )
-        # Total page requests = 4 + 2 + 4 = 10.
-        # Hits: Q1 has none from Q0 (D[0][1] = 0); Q2 picks up 4 from
-        # Q0 via the window (D[0][2] = 4, no other in-window
-        # contribution because D[1][2] = 0 so the discount drops out).
-        # Expected fitness = 4 / 10.
-        assert abs(f - 4 / 10) < 1e-9
-
-    def test_windowed_discount_caps_double_count(self):
-        # Q0 and Q1 both deliver pages {0, 1, 2, 3} fully to Q2.  With
-        # capacity 100 everything fits.
-        # D[0][1] = D[0][2] = D[1][2] = 4.  page_counts = [4, 4, 4].
-        # For Q2 with q-capacity 4:
-        #   - prev=Q1: incremental=4, discount=0, contributes 4.
-        #     counted_d_sum becomes 4.
-        #   - prev=Q0: incremental=4, discount = 4 * 4 / 4 = 4,
-        #     contributes max(0, 4-4) = 0.
-        # So Q2 total hits = 4, not 8.  This is the independence-
-        # estimate discount preventing double-counting of pages that
-        # multiple predecessors deliver.
-        page_sets = [
-            frozenset({0, 1, 2, 3}),
-            frozenset({0, 1, 2, 3}),
-            frozenset({0, 1, 2, 3}),
-        ]
-        capacity = 100
-        D = compute_directional_matrix(
-            page_sets, cache_capacity_pages=capacity,
-        )
-        page_counts = [len(ps) for ps in page_sets]
-        f = approximate_schedule_fitness_directional(
-            D, page_counts, [0, 1, 2], cache_capacity_pages=capacity,
-        )
-        # Q1 picks up 4 hits from Q0; Q2 picks up 4 hits (not 8) due to
-        # the discount.  Total hits = 8.  Total requests = 12.
-        assert abs(f - 8 / 12) < 1e-9
+        # Total requests = 4 + 2 + 4 = 10.
+        # Q1 picks up 0 from Q0 (D[0][1] = 0).
+        # Q2 picks up 0 from Q1 (D[1][2] = 0).
+        # Single-step credit = 0/10 = 0.0.
+        assert f == 0.0
 
 
 class TestEncodePageSetsDeterminism:
