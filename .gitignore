@@ -12,3 +12,7 @@ __pycache__
 # IDE-specific files
 .vscode/
 .DS_Store
+page_access/
+experiment_logs/
+plots/
+*.patch
