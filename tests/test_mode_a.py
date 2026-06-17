@@ -311,6 +311,48 @@ class TestRunnerEndToEnd:
         assert res.early_stopped
         assert res.num_parameter_trials < 500
 
+    def test_budget_is_nested(self, tmp_path):
+        # With early stopping disabled, a larger budget must reach a cost
+        # no worse than a smaller budget (it evaluates a superset).
+        ps, qids = _workload(n=12)
+        costs = []
+        for mt in (15, 30, 60):
+            r = run_mode_a(
+                page_sets=ps, query_ids=qids, workload="tpch",
+                cache_pages=CACHE, family="d",
+                consumer="multistart_greedy", seed=42, max_trials=mt,
+                early_stop_patience=10 ** 6, output_dir=tmp_path / f"b{mt}",
+            )
+            costs.append(r.best_cost)
+        assert costs[0] >= costs[1] >= costs[2]
+
+    def test_random_only_mode_runs(self, tmp_path):
+        ps, qids = _workload(n=10)
+        r = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42,
+            max_trials=20, search_mode="random_only",
+            early_stop_patience=10 ** 6, output_dir=tmp_path,
+        )
+        assert is_valid_permutation(
+            [qids.index(q) for q in r.best_schedule_qids], 10
+        )
+        assert r.stop_reason in (
+            "budget_exhausted", "early_stop_random_phase"
+        )
+
+    def test_stop_reason_recorded(self, tmp_path):
+        ps, qids = _workload(n=8)
+        r = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42,
+            max_trials=500, early_stop_patience=5, output_dir=tmp_path,
+        )
+        assert r.early_stopped
+        assert r.stop_reason in (
+            "early_stop_random_phase", "early_stop_refinement"
+        )
+
     def test_feature_stats_records_overlap_survivor(self, tmp_path):
         ps, qids = _workload(n=10)
         res = run_mode_a(

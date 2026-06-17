@@ -77,6 +77,7 @@ class ModeARunResult:
     num_parameter_trials: int = 0
     num_exact_evals: int = 0
     early_stopped: bool = False
+    stop_reason: str = ""
     output_dir: str = ""
 
 
@@ -266,7 +267,7 @@ def run_mode_a(
         Best schedule/config and run metadata.
     """
     t_start = time.perf_counter()
-    timing: dict[str, float] = {}
+    timing: dict[str, object] = {}
 
     run_id = run_id or f"{workload}_c{cache_pages}_{family}_{consumer}_s{seed}_{int(t_start)}"
     outdir = (output_dir or Path("experiment_logs/mode_a")) / run_id
@@ -429,6 +430,19 @@ def run_mode_a(
             trials_since_improve += 1
         record_trial(prop, winner, evals, improved, construct_s, sim_s)
 
+    # Budget-independent random pool: a fixed, seed-determined sequence of
+    # random configs.  Both short and long budgets consume a *prefix* of
+    # this pool, so a longer budget evaluates a superset of a shorter
+    # one's proposals (unless early stopping cuts it off first) — the
+    # search is nested across budgets.  Pool size is generous; the trial
+    # budget, not the pool, bounds how many are actually evaluated.
+    RANDOM_POOL_SIZE = 1024
+    random_pool = [
+        random_config(family, topk_values, rng)
+        for _ in range(RANDOM_POOL_SIZE)
+    ]
+    stop_reason = "budget_exhausted"
+
     # --- Phase 1: warm-up ---
     t0 = time.perf_counter()
     for prop in warmup_configs(family, topk_values):
@@ -438,16 +452,26 @@ def run_mode_a(
     timing["warmup"] = time.perf_counter() - t0
     warmup_done = True
 
-    # --- Phase 2: random-weight baseline ---
+    # --- Phase 2: random-weight baseline (prefix of the fixed pool) ---
+    # In random_only mode this phase uses the entire remaining budget; in
+    # full mode it uses up to half, leaving room for refinement.  Either
+    # way it draws the pool in order, so budgets stay nested.
     t0 = time.perf_counter()
-    random_quota = max(0, (max_trials - trial_id) // 2) \
-        if search_mode == "warmup_random_neighbor" else (max_trials - trial_id)
-    for _ in range(random_quota):
+    pool_idx = 0
+    if search_mode == "warmup_random_neighbor":
+        random_cap = max(0, (max_trials - trial_id) // 2)
+    else:  # random_only
+        random_cap = max_trials - trial_id
+    for _ in range(random_cap):
         if eval_id >= max_schedule_evals or trial_id >= max_trials:
             break
-        process(random_config(family, topk_values, rng))
+        if pool_idx >= len(random_pool):
+            break
+        process(random_pool[pool_idx])
+        pool_idx += 1
         if trials_since_improve >= early_stop_patience:
             early_stopped = True
+            stop_reason = "early_stop_random_phase"
             break
     timing["random_search"] = time.perf_counter() - t0
 
@@ -470,10 +494,13 @@ def run_mode_a(
                     improved_in_pass = True
                 if trials_since_improve >= early_stop_patience:
                     early_stopped = True
+                    stop_reason = "early_stop_refinement"
                     break
             # Stop refining if a full neighbour pass found nothing better
             # or the anchor is unchanged.
             if early_stopped or not improved_in_pass or best_config is anchor:
+                if not early_stopped:
+                    stop_reason = "refinement_converged"
                 refine = False
     timing["neighbor_refinement"] = time.perf_counter() - t0
 
@@ -487,6 +514,9 @@ def run_mode_a(
         best_eval.schedule_eval_id if best_eval else 0
     )
     timing["early_stopped"] = early_stopped
+    timing["stop_reason"] = stop_reason
+    timing["parameter_trials_run"] = trial_id
+    timing["exact_evals_run"] = eval_id
 
     # --- Write remaining artifacts ---
     t0 = time.perf_counter()
@@ -540,6 +570,7 @@ def run_mode_a(
         num_parameter_trials=trial_id,
         num_exact_evals=eval_id,
         early_stopped=early_stopped,
+        stop_reason=stop_reason,
         output_dir=str(outdir),
     )
     (outdir / "summary.json").write_text(json.dumps(asdict(result), indent=2))
