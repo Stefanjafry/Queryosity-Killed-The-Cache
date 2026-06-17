@@ -13,7 +13,7 @@ import random
 
 import pytest
 
-from src.bayesopt.priority import is_valid_permutation
+from src.bayesopt.objective import is_valid_permutation
 from src.bayesopt.run_baselines import (
     BASELINE_METHODS,
     compute_baseline_schedule,

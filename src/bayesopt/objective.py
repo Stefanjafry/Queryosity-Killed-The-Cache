@@ -22,6 +22,25 @@ from typing import Sequence
 from src.simulator.cache_simulator import simulate_schedule_page_level
 
 
+def is_valid_permutation(schedule: Sequence[int], n: int) -> bool:
+    """
+    Check that *schedule* is a permutation of ``range(n)``.
+
+    Parameters
+    ----------
+    schedule : Sequence[int]
+        Candidate schedule.
+    n : int
+        Expected number of queries.
+
+    Returns
+    -------
+    bool
+        True iff every query index appears exactly once.
+    """
+    return len(schedule) == n and sorted(schedule) == list(range(n))
+
+
 @dataclass(frozen=True)
 class EvalMetrics:
     """
@@ -134,4 +153,4 @@ class ExactSimObjective:
         return metrics, False
 
 
-__all__ = ["EvalMetrics", "ExactSimObjective"]
+__all__ = ["EvalMetrics", "ExactSimObjective", "is_valid_permutation"]

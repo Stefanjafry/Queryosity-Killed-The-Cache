@@ -1,14 +1,15 @@
 """
-Bayesian-optimization consumers for the directional scheduling pipeline.
+Bayesian-optimization support for the directional scheduling pipeline.
 
-Mode B (this package, first deliverable): BO as a *direct scheduler*.
-A continuous priority vector p ∈ [0, 1]^n is decoded into a permutation
-by descending argsort (ties broken by query index), and every candidate
-schedule is scored by the **exact clock-sweep simulator** — never by the
-edge-sum surrogate.  Backends share one trial recorder so that random
-search, SMAC3 and BoTorch are compared at identical evaluation budgets
-with identical logging.
+This package provides the database-free profile loader
+(:mod:`src.bayesopt.data`), the memoized exact clock-sweep objective
+(:mod:`src.bayesopt.objective`), and fresh-regeneration of the
+incumbent baselines (:mod:`src.bayesopt.run_baselines`) — greedy_d,
+ga_m, ga_d — all scored on the exact simulator in a single consistent
+cost unit (1 - F_hit) so that any BO consumer can be compared against
+them directly.
 
-Mode A (BO-tuned D scorer) is intentionally absent; it is built only
-after Mode B has been implemented, audited and interpreted.
+The direct-scheduler (priority-vector) BO experiment that previously
+lived here was evaluated, found non-competitive with the D-specialized
+consumers, and removed; only the shared infrastructure above remains.
 """

@@ -33,7 +33,7 @@ from pathlib import Path
 
 from src.bayesopt.data import load_workload_pages
 from src.bayesopt.objective import EvalMetrics, ExactSimObjective
-from src.bayesopt.priority import is_valid_permutation
+from src.bayesopt.objective import is_valid_permutation
 from src.scheduler.genetic_algorithm import run_ga
 from src.scheduler.genetic_config import ApproxMode, GAConfig
 from src.scheduler.greedy_directional import greedy_directional_schedule
