@@ -19,7 +19,85 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from src.simulator.cache_simulator import simulate_schedule_page_level
+from src.simulator.cache_simulator import (
+    PageClockSweepCache,
+    simulate_schedule_page_level,
+)
+
+
+@dataclass(frozen=True)
+class PerQueryTrace:
+    """
+    Per-query simulation record at one schedule position.
+
+    Attributes
+    ----------
+    position : int
+        0-based execution position in the schedule.
+    query_index : int
+        Query index executed at this position.
+    requests : int
+        Pages requested by this query.
+    hits : int
+        Pages served from cache.
+    misses : int
+        ``requests − hits``.
+    """
+
+    position: int
+    query_index: int
+    requests: int
+    hits: int
+    misses: int
+
+
+def simulate_schedule_page_level_traced(
+    page_sets: list[frozenset[int]],
+    schedule: Sequence[int],
+    cache_capacity_pages: int,
+) -> tuple[int, int, list[PerQueryTrace]]:
+    """
+    Simulate a schedule and return per-query metrics from the same pass.
+
+    Replays the schedule through one clock-sweep cache, capturing each
+    query's request and hit counts as it goes — a single O(n) pass, not
+    prefix re-simulation.  The aggregate totals match
+    :func:`simulate_schedule_page_level` exactly.
+
+    Parameters
+    ----------
+    page_sets : list[frozenset[int]]
+        Integer-encoded per-query page sets.
+    schedule : Sequence[int]
+        Permutation of ``range(len(page_sets))``.
+    cache_capacity_pages : int
+        Cache capacity in pages.
+
+    Returns
+    -------
+    tuple[int, int, list[PerQueryTrace]]
+        ``(total_requests, total_hits, per_query_traces)``.
+    """
+    cache = PageClockSweepCache(cache_capacity_pages)
+    total_requests = 0
+    total_hits = 0
+    traces: list[PerQueryTrace] = []
+    for position, idx in enumerate(schedule):
+        pages = page_sets[idx]
+        req = len(pages)
+        hits = cache.batch_access(pages)
+        total_requests += req
+        total_hits += hits
+        traces.append(
+            PerQueryTrace(
+                position=position,
+                query_index=idx,
+                requests=req,
+                hits=hits,
+                misses=req - hits,
+            )
+        )
+    return total_requests, total_hits, traces
 
 
 def is_valid_permutation(schedule: Sequence[int], n: int) -> bool:
@@ -153,4 +231,10 @@ class ExactSimObjective:
         return metrics, False
 
 
-__all__ = ["EvalMetrics", "ExactSimObjective", "is_valid_permutation"]
+__all__ = [
+    "EvalMetrics",
+    "ExactSimObjective",
+    "PerQueryTrace",
+    "is_valid_permutation",
+    "simulate_schedule_page_level_traced",
+]
