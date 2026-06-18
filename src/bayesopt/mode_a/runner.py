@@ -81,6 +81,9 @@ class ModeARunResult:
     stop_reason: str = ""
     refinement_ran: bool = False
     neighbor_configs_evaluated: int = 0
+    bo_warmup: int = 0
+    bo_init: int = 0
+    bo_suggestions: int = 0
     output_dir: str = ""
 
 
@@ -423,11 +426,14 @@ def run_mode_a(
             "consumer": consumer,
         })
 
+    last_trial_cost = [1.0]  # holder: cost of the most recent trial winner
+
     def process(prop: Proposal) -> None:
         nonlocal trial_id, best_cost, best_eval, best_config, best_source
         nonlocal trials_since_improve, t_construct, t_sim
         trial_id += 1
         winner, evals, construct_s, sim_s = evaluate_config(prop)
+        last_trial_cost[0] = winner.cost
         t_construct += construct_s
         t_sim += sim_s
         improved = winner.cost < best_cost
@@ -455,13 +461,15 @@ def run_mode_a(
     stop_reason = "budget_exhausted"
     refinement_ran = False
     neighbor_configs_evaluated = 0
+    bo_counts = {"n_warmup": 0, "n_init": 0, "n_bo": 0}
 
+    use_botorch = search_mode == "botorch_gp"
     use_warmup = search_mode in ("warmup_random", "warmup_random_neighbor")
     use_refine = search_mode == "warmup_random_neighbor"
 
     # --- Phase 1: warm-up (skipped in random_only — the true floor) ---
     t0 = time.perf_counter()
-    if use_warmup:
+    if use_warmup and not use_botorch:
         for prop in warmup_configs(family, topk_values):
             if trial_id >= max_trials or eval_id >= max_schedule_evals:
                 break
@@ -477,23 +485,24 @@ def run_mode_a(
     # before the optimizer is ever exercised.
     t0 = time.perf_counter()
     pool_idx = 0
-    if use_refine:
-        random_cap = max(0, (max_trials - trial_id) // 2)
-    else:
-        random_cap = max_trials - trial_id
-    for _ in range(random_cap):
-        if eval_id >= max_schedule_evals or trial_id >= max_trials:
-            break
-        if pool_idx >= len(random_pool):
-            break
-        process(random_pool[pool_idx])
-        pool_idx += 1
-        # Early stop applies only when there is no refinement phase to
-        # follow; in full mode we never early-stop during random.
-        if not use_refine and trials_since_improve >= early_stop_patience:
-            early_stopped = True
-            stop_reason = "early_stop_random_phase"
-            break
+    if not use_botorch:
+        if use_refine:
+            random_cap = max(0, (max_trials - trial_id) // 2)
+        else:
+            random_cap = max_trials - trial_id
+        for _ in range(random_cap):
+            if eval_id >= max_schedule_evals or trial_id >= max_trials:
+                break
+            if pool_idx >= len(random_pool):
+                break
+            process(random_pool[pool_idx])
+            pool_idx += 1
+            # Early stop applies only when there is no refinement phase to
+            # follow; in full mode we never early-stop during random.
+            if not use_refine and trials_since_improve >= early_stop_patience:
+                early_stopped = True
+                stop_reason = "early_stop_random_phase"
+                break
     timing["random_search"] = time.perf_counter() - t0
 
     # --- Phase 3: neighbour refinement around the incumbent ---
@@ -502,7 +511,7 @@ def run_mode_a(
     # budget allows; early stopping can trigger only from the second
     # pass onward.
     t0 = time.perf_counter()
-    if use_refine and best_config is not None:
+    if use_refine and not use_botorch and best_config is not None:
         refine = True
         first_pass = True
         while (refine and trial_id < max_trials
@@ -533,6 +542,58 @@ def run_mode_a(
     timing["neighbor_refinement"] = time.perf_counter() - t0
     timing["refinement_ran"] = refinement_ran
     timing["neighbor_configs_evaluated"] = neighbor_configs_evaluated
+
+    # --- Phase 4: BoTorch GP loop (botorch_gp mode only) ---
+    # warm-up anchors + Sobol initial design + GP/LogEI acquisition.
+    # Early stopping is suppressed until ALL warm-ups, ALL init points,
+    # and at least `bo_min_suggestions` acquisition steps have run, so a
+    # real BO attempt is always made before any cutoff.
+    t0 = time.perf_counter()
+    if use_botorch:
+        from src.bayesopt.mode_a.botorch_backend import propose_botorch
+
+        # Budget split: ~1/3 init, the rest acquisition, capped by trials.
+        remaining = max_trials - trial_id
+        n_warmup_expected = len(warmup_configs(family, topk_values))
+        budget_after_warmup = max(0, remaining - n_warmup_expected)
+        n_init = max(6, budget_after_warmup // 3)
+        n_bo = max(0, budget_after_warmup - n_init)
+        bo_min_suggestions = min(n_bo, 10)
+
+        def _should_stop() -> bool:
+            # Hard caps only; early-stop patience is enforced separately
+            # after the forced minimum of BO suggestions.
+            if eval_id >= max_schedule_evals or trial_id >= max_trials:
+                return True
+            if (bo_counts["n_bo"] >= bo_min_suggestions
+                    and trials_since_improve >= early_stop_patience):
+                return True
+            return False
+
+        def _evaluate_real(cfg: ScorerConfig, source: str) -> float:
+            # Evaluate THIS config (records the trial) and return its own
+            # trial-winner cost — not the incumbent's — so the GP learns
+            # the realized response surface.
+            process(Proposal(cfg, source))
+            return last_trial_cost[0]
+
+        bo_counts = propose_botorch(
+            family=family,
+            topk_values=topk_values,
+            evaluate=_evaluate_real,
+            n_init=n_init,
+            n_bo=n_bo,
+            seed=seed,
+            should_stop=_should_stop,
+        )
+        if (bo_counts["n_bo"] >= bo_min_suggestions
+                and trials_since_improve >= early_stop_patience):
+            early_stopped = True
+            stop_reason = "early_stop_botorch"
+        else:
+            stop_reason = "botorch_budget_exhausted"
+    timing["botorch"] = time.perf_counter() - t0
+    timing["bo_counts"] = bo_counts
 
     timing["schedule_construction"] = t_construct
     timing["exact_simulation"] = t_sim
@@ -603,6 +664,9 @@ def run_mode_a(
         stop_reason=stop_reason,
         refinement_ran=refinement_ran,
         neighbor_configs_evaluated=neighbor_configs_evaluated,
+        bo_warmup=bo_counts["n_warmup"],
+        bo_init=bo_counts["n_init"],
+        bo_suggestions=bo_counts["n_bo"],
         output_dir=str(outdir),
     )
     (outdir / "summary.json").write_text(json.dumps(asdict(result), indent=2))

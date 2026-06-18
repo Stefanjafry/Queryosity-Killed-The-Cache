@@ -430,3 +430,68 @@ class TestRunnerEndToEnd:
         edge_ids = {r["schedule_eval_id"] for r in edge}
         # Every edge-logged schedule is a trial winner.
         assert edge_ids <= winners
+
+
+class TestBotorchBackend:
+    """BoTorch GP arm.  GP-fit tests skip when botorch is absent; the
+    unit-cube mapping helpers and runner integration run everywhere."""
+
+    def test_unit_cube_mapping_roundtrip(self):
+        from src.bayesopt.mode_a.botorch_backend import (
+            _bounds_for, _config_from_unit, _config_to_unit,
+        )
+        from src.bayesopt.mode_a.scorers import ScorerConfig
+        dims = _bounds_for("d")
+        cfg = ScorerConfig(family="d", topk=5, lambda_out=1.0,
+                           lambda_size=0.5, lambda_balance=2.0,
+                           lambda_asym=0.0)
+        unit = _config_to_unit(cfg, dims)
+        assert all(0.0 <= u <= 1.0 for u in unit)
+        back = _config_from_unit("d", 5, unit, dims)
+        for name, _, _ in dims:
+            assert abs(getattr(back, name) - getattr(cfg, name)) < 1e-9
+
+    def test_unit_cube_clamps_out_of_range(self):
+        from src.bayesopt.mode_a.botorch_backend import (
+            _bounds_for, _config_from_unit,
+        )
+        dims = _bounds_for("d")
+        cfg = _config_from_unit("d", 3, [2.0, -1.0, 0.5, 0.5], dims)
+        for name, lo, hi in dims:
+            assert lo <= getattr(cfg, name) <= hi
+
+    def test_botorch_run_if_available(self, tmp_path):
+        pytest.importorskip("botorch")
+        ps, qids = _workload(n=10)
+        r = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42,
+            max_trials=40, search_mode="botorch_gp",
+            early_stop_patience=10 ** 6, output_dir=tmp_path,
+        )
+        assert is_valid_permutation(
+            [qids.index(q) for q in r.best_schedule_qids], 10
+        )
+        assert r.bo_warmup > 0
+        assert r.bo_init > 0
+        # recommender must return the true minimum-cost schedule
+        rows = list(csv.DictReader(
+            open(Path(r.output_dir) / "candidate_schedules.csv")))
+        mincost = min(float(x["cost"]) for x in rows)
+        assert abs(r.best_cost - mincost) < 1e-6
+
+    def test_botorch_determinism_if_available(self, tmp_path):
+        pytest.importorskip("botorch")
+        ps, qids = _workload(n=10)
+        a = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42, max_trials=30,
+            search_mode="botorch_gp", early_stop_patience=10 ** 6,
+            output_dir=tmp_path / "a")
+        b = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42, max_trials=30,
+            search_mode="botorch_gp", early_stop_patience=10 ** 6,
+            output_dir=tmp_path / "b")
+        assert a.best_cost == b.best_cost
+        assert a.best_schedule_qids == b.best_schedule_qids
