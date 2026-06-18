@@ -203,6 +203,8 @@ def propose_botorch(
                     acqf, bounds=bounds, q=1,
                     num_restarts=8, raw_samples=128,
                 )
+                if acq_val is None or cand is None:
+                    continue
                 v = float(acq_val)
                 if v > best_acq:
                     best_acq = v
