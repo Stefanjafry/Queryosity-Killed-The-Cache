@@ -306,10 +306,13 @@ class TestRunnerEndToEnd:
             family="d", consumer="multistart_greedy", seed=42,
             max_trials=500, early_stop_patience=5, output_dir=tmp_path,
         )
-        # With a tiny workload and tight patience, the search must stop
-        # well short of the 500-trial cap.
-        assert res.early_stopped
+        # The search must terminate well short of the 500-trial cap,
+        # whether by early stopping or by refinement converging.
         assert res.num_parameter_trials < 500
+        assert res.stop_reason in (
+            "early_stop_random_phase", "early_stop_refinement",
+            "refinement_converged",
+        )
 
     def test_budget_is_nested(self, tmp_path):
         # With early stopping disabled, a larger budget must reach a cost
@@ -337,9 +340,53 @@ class TestRunnerEndToEnd:
         assert is_valid_permutation(
             [qids.index(q) for q in r.best_schedule_qids], 10
         )
-        assert r.stop_reason in (
-            "budget_exhausted", "early_stop_random_phase"
+        # random_only must not run warm-up or refinement.
+        assert r.refinement_ran is False
+        assert r.neighbor_configs_evaluated == 0
+        assert r.best_source in ("random", "neighbor:_none")
+        assert not r.best_source.startswith("warmup")
+
+    def test_warmup_random_mode_no_refinement(self, tmp_path):
+        ps, qids = _workload(n=10)
+        r = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42,
+            max_trials=30, search_mode="warmup_random",
+            early_stop_patience=10 ** 6, output_dir=tmp_path,
         )
+        assert r.refinement_ran is False
+        assert r.neighbor_configs_evaluated == 0
+
+    def test_full_mode_forces_refinement(self, tmp_path):
+        ps, qids = _workload(n=12)
+        r = run_mode_a(
+            page_sets=ps, query_ids=qids, workload="tpch", cache_pages=CACHE,
+            family="d", consumer="multistart_greedy", seed=42,
+            max_trials=60, search_mode="warmup_random_neighbor",
+            early_stop_patience=5, output_dir=tmp_path,
+        )
+        # Refinement must be exercised at least once even with tight
+        # patience (early stop is suppressed during the forced first pass).
+        assert r.refinement_ran is True
+        assert r.neighbor_configs_evaluated > 0
+
+    def test_three_arms_are_distinct(self, tmp_path):
+        ps, qids = _workload(n=14)
+        outs = {}
+        for mode in ("random_only", "warmup_random",
+                     "warmup_random_neighbor"):
+            r = run_mode_a(
+                page_sets=ps, query_ids=qids, workload="tpch",
+                cache_pages=CACHE, family="d",
+                consumer="multistart_greedy", seed=42, max_trials=50,
+                search_mode=mode, early_stop_patience=8,
+                output_dir=tmp_path / mode,
+            )
+            outs[mode] = r
+        # Only the full arm runs refinement.
+        assert outs["random_only"].refinement_ran is False
+        assert outs["warmup_random"].refinement_ran is False
+        assert outs["warmup_random_neighbor"].refinement_ran is True
 
     def test_stop_reason_recorded(self, tmp_path):
         ps, qids = _workload(n=8)
@@ -348,9 +395,11 @@ class TestRunnerEndToEnd:
             family="d", consumer="multistart_greedy", seed=42,
             max_trials=500, early_stop_patience=5, output_dir=tmp_path,
         )
-        assert r.early_stopped
+        # Termination is recorded with a concrete reason (the tiny space
+        # may converge before patience triggers).
         assert r.stop_reason in (
-            "early_stop_random_phase", "early_stop_refinement"
+            "early_stop_random_phase", "early_stop_refinement",
+            "refinement_converged", "budget_exhausted",
         )
 
     def test_feature_stats_records_overlap_survivor(self, tmp_path):

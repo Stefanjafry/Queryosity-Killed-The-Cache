@@ -55,7 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beam-widths", type=_int_csv, default=(2, 4, 8))
     p.add_argument("--topk-values", type=_int_csv, default=(3, 5, 10))
     p.add_argument("--search-mode",
-                   choices=["warmup_random_neighbor", "random_only"],
+                   choices=["warmup_random_neighbor", "warmup_random",
+                            "random_only"],
                    default="warmup_random_neighbor")
     p.add_argument("--exclude", default="")
     p.add_argument("--log-all-candidates", action="store_true")

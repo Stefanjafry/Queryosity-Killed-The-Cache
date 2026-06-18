@@ -42,6 +42,7 @@ from src.bayesopt.mode_a.search_space import (
 )
 from src.bayesopt.objective import simulate_schedule_page_level_traced
 import random as _random
+from uuid import uuid4
 
 
 @dataclass
@@ -78,6 +79,8 @@ class ModeARunResult:
     num_exact_evals: int = 0
     early_stopped: bool = False
     stop_reason: str = ""
+    refinement_ran: bool = False
+    neighbor_configs_evaluated: int = 0
     output_dir: str = ""
 
 
@@ -257,9 +260,14 @@ def run_mode_a(
     Run one Mode A scorer search and write all artifacts.
 
     Parameters mirror the CLI; see module docstring for the pipeline.
-    ``search_mode`` is ``"warmup_random_neighbor"`` (full) or
-    ``"random_only"`` (warm-up + random, no refinement — the honesty
-    floor in isolation).
+    ``search_mode`` is one of:
+
+    * ``"random_only"`` — random weights only, **no warm-up** (the true
+      honesty floor: pure random sampling over the scorer space).
+    * ``"warmup_random"`` — warm-up grid + random, **no refinement**.
+    * ``"warmup_random_neighbor"`` — warm-up + random + neighbour
+      refinement, with at least one forced refinement pass before early
+      stopping can trigger (so the optimizer is always exercised).
 
     Returns
     -------
@@ -269,7 +277,10 @@ def run_mode_a(
     t_start = time.perf_counter()
     timing: dict[str, object] = {}
 
-    run_id = run_id or f"{workload}_c{cache_pages}_{family}_{consumer}_s{seed}_{int(t_start)}"
+    run_id = run_id or (
+        f"{workload}_c{cache_pages}_{family}_{consumer}_{search_mode}"
+        f"_s{seed}_{int(t_start)}_{uuid4().hex[:6]}"
+    )
     outdir = (output_dir or Path("experiment_logs/mode_a")) / run_id
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -442,25 +453,33 @@ def run_mode_a(
         for _ in range(RANDOM_POOL_SIZE)
     ]
     stop_reason = "budget_exhausted"
+    refinement_ran = False
+    neighbor_configs_evaluated = 0
 
-    # --- Phase 1: warm-up ---
+    use_warmup = search_mode in ("warmup_random", "warmup_random_neighbor")
+    use_refine = search_mode == "warmup_random_neighbor"
+
+    # --- Phase 1: warm-up (skipped in random_only — the true floor) ---
     t0 = time.perf_counter()
-    for prop in warmup_configs(family, topk_values):
-        if trial_id >= max_trials or eval_id >= max_schedule_evals:
-            break
-        process(prop)
+    if use_warmup:
+        for prop in warmup_configs(family, topk_values):
+            if trial_id >= max_trials or eval_id >= max_schedule_evals:
+                break
+            process(prop)
     timing["warmup"] = time.perf_counter() - t0
     warmup_done = True
 
-    # --- Phase 2: random-weight baseline (prefix of the fixed pool) ---
-    # In random_only mode this phase uses the entire remaining budget; in
-    # full mode it uses up to half, leaving room for refinement.  Either
-    # way it draws the pool in order, so budgets stay nested.
+    # --- Phase 2: random-weight phase (prefix of the fixed pool) ---
+    # full mode reserves budget for refinement (half); the other modes
+    # spend the whole remaining budget on random.  Early stopping is
+    # SUPPRESSED here in full mode so refinement is guaranteed at least
+    # one pass — otherwise a lucky random draw could end the search
+    # before the optimizer is ever exercised.
     t0 = time.perf_counter()
     pool_idx = 0
-    if search_mode == "warmup_random_neighbor":
+    if use_refine:
         random_cap = max(0, (max_trials - trial_id) // 2)
-    else:  # random_only
+    else:
         random_cap = max_trials - trial_id
     for _ in range(random_cap):
         if eval_id >= max_schedule_evals or trial_id >= max_trials:
@@ -469,17 +488,23 @@ def run_mode_a(
             break
         process(random_pool[pool_idx])
         pool_idx += 1
-        if trials_since_improve >= early_stop_patience:
+        # Early stop applies only when there is no refinement phase to
+        # follow; in full mode we never early-stop during random.
+        if not use_refine and trials_since_improve >= early_stop_patience:
             early_stopped = True
             stop_reason = "early_stop_random_phase"
             break
     timing["random_search"] = time.perf_counter() - t0
 
     # --- Phase 3: neighbour refinement around the incumbent ---
+    # Full mode only.  At least one neighbour pass is forced (the random
+    # phase does not early-stop), so refinement is always exercised when
+    # budget allows; early stopping can trigger only from the second
+    # pass onward.
     t0 = time.perf_counter()
-    if (search_mode == "warmup_random_neighbor" and not early_stopped
-            and best_config is not None):
+    if use_refine and best_config is not None:
         refine = True
+        first_pass = True
         while (refine and trial_id < max_trials
                and eval_id < max_schedule_evals):
             assert best_config is not None
@@ -488,21 +513,26 @@ def run_mode_a(
             for prop in neighbor_configs(anchor, topk_values):
                 if trial_id >= max_trials or eval_id >= max_schedule_evals:
                     break
+                refinement_ran = True
+                neighbor_configs_evaluated += 1
                 before = best_cost
                 process(prop)
                 if best_cost < before:
                     improved_in_pass = True
-                if trials_since_improve >= early_stop_patience:
+                # Suppress early stop during the first forced pass.
+                if (not first_pass
+                        and trials_since_improve >= early_stop_patience):
                     early_stopped = True
                     stop_reason = "early_stop_refinement"
                     break
-            # Stop refining if a full neighbour pass found nothing better
-            # or the anchor is unchanged.
+            first_pass = False
             if early_stopped or not improved_in_pass or best_config is anchor:
                 if not early_stopped:
                     stop_reason = "refinement_converged"
                 refine = False
     timing["neighbor_refinement"] = time.perf_counter() - t0
+    timing["refinement_ran"] = refinement_ran
+    timing["neighbor_configs_evaluated"] = neighbor_configs_evaluated
 
     timing["schedule_construction"] = t_construct
     timing["exact_simulation"] = t_sim
@@ -571,6 +601,8 @@ def run_mode_a(
         num_exact_evals=eval_id,
         early_stopped=early_stopped,
         stop_reason=stop_reason,
+        refinement_ran=refinement_ran,
+        neighbor_configs_evaluated=neighbor_configs_evaluated,
         output_dir=str(outdir),
     )
     (outdir / "summary.json").write_text(json.dumps(asdict(result), indent=2))
