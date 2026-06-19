@@ -158,7 +158,14 @@ def propose_botorch(
         observe(prop.config, prop.source)
         counts["n_warmup"] += 1
 
-    # --- Sobol initial design, spread across strata ---
+    # --- Sobol initial design (FIXED size, budget-independent) ---
+    # n_init does not depend on the trial budget, so a larger-budget run
+    # shares the SAME initial design as a smaller one and differs only in
+    # the number of acquisition steps that follow.  This makes the arm as
+    # close to budget-nested as a GP-acquisition loop can be: the init
+    # (which drives the result most on this jagged objective) is stable,
+    # and only the acquisition tail grows.  A separate, fixed Sobol engine
+    # serves acquisition-phase fallbacks so they too are reproducible.
     sobol = SobolEngine(dimension=d, scramble=True, seed=seed)
     for i in range(n_init):
         if should_stop():
@@ -168,6 +175,8 @@ def propose_botorch(
         cfg = _config_from_unit(family, topk, unit, dims)
         observe(cfg, "botorch_init")
         counts["n_init"] += 1
+
+    fallback_sobol = SobolEngine(dimension=d, scramble=True, seed=seed + 1)
 
     bounds = torch.stack(
         [torch.zeros(d, dtype=dtype), torch.ones(d, dtype=dtype)]
@@ -212,12 +221,12 @@ def propose_botorch(
                     best_cfg = _config_from_unit(family, topk, unit, dims)
             except Exception:
                 # Ill-conditioned fit: remember a Sobol fallback point.
-                fallback_unit = _as_floats(sobol.draw(1).to(dtype).squeeze(0).tolist())
+                fallback_unit = _as_floats(fallback_sobol.draw(1).to(dtype).squeeze(0).tolist())
 
         if best_cfg is None:
             # No stratum could fit a GP (or all failed): Sobol fallback.
             if fallback_unit is None:
-                fallback_unit = _as_floats(sobol.draw(1).to(dtype).squeeze(0).tolist())
+                fallback_unit = _as_floats(fallback_sobol.draw(1).to(dtype).squeeze(0).tolist())
             topk = topk_values[counts["n_bo"] % len(topk_values)]
             best_cfg = _config_from_unit(family, topk, fallback_unit, dims)
             observe(best_cfg, "botorch_fallback")

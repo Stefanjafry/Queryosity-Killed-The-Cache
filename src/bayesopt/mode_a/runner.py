@@ -552,11 +552,15 @@ def run_mode_a(
     if use_botorch:
         from src.bayesopt.mode_a.botorch_backend import propose_botorch
 
-        # Budget split: ~1/3 init, the rest acquisition, capped by trials.
+        # Budget-independent initial design: a FIXED init size so a larger
+        # max_trials shares the same Sobol init as a smaller one and only
+        # extends the acquisition tail (budget-nesting for the BO arm, as
+        # far as a GP loop permits).  The trial budget bounds total evals.
         remaining = max_trials - trial_id
         n_warmup_expected = len(warmup_configs(family, topk_values))
+        FIXED_N_INIT = 24
         budget_after_warmup = max(0, remaining - n_warmup_expected)
-        n_init = max(6, budget_after_warmup // 3)
+        n_init = min(FIXED_N_INIT, budget_after_warmup)
         n_bo = max(0, budget_after_warmup - n_init)
         bo_min_suggestions = min(n_bo, 10)
 

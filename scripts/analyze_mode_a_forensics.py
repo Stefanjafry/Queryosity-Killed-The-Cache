@@ -142,6 +142,124 @@ def _perq_for(d: Path, eval_id: str) -> list[dict]:
             if r["schedule_eval_id"] == eval_id]
 
 
+def query_autopsy(d: Path, target: str) -> dict:
+    """
+    Reconstruct one query's local neighbourhood in a run's best schedule.
+
+    Reports the target's position, predecessor/successor, its own
+    hit/miss/request counts, the directional/overlap/survivor stats of
+    the edge *into* it, the two queries before it, and a heuristic
+    classification of what went wrong (placed early/late, after a weak
+    predecessor, or after an evicting query).
+
+    Read-only; uses the trial-winner per-query and edge logs.
+    """
+    eid = _incumbent_eval_id(d)
+    if not eid:
+        return {"available": False, "reason": "no incumbent eval id"}
+    perq = _perq_for(d, eid)
+    edges = _edge_rows_for(d, eid)
+    if not perq:
+        return {"available": False, "reason": "no per-query rows"}
+
+    # locate target in the per-query trace
+    row = next((r for r in perq if r["query_id"] == target), None)
+    if row is None:
+        return {"available": False, "reason": f"{target} not in schedule"}
+    pos = int(row["position"])
+    n = len(perq)
+    by_pos = {int(r["position"]): r for r in perq}
+    pred = by_pos.get(pos - 1)
+    succ = by_pos.get(pos + 1)
+    pred2 = by_pos.get(pos - 2)
+
+    # edge INTO target (next_query == target)
+    edge_in = next((e for e in edges if e["next_query"] == target), None)
+    # edge OUT of target (prev_query == target)
+    edge_out = next((e for e in edges if e["prev_query"] == target), None)
+
+    info: dict = {
+        "available": True,
+        "schedule_eval_id": eid,
+        "position": pos,
+        "n_queries": n,
+        "relative_position": round(pos / max(n - 1, 1), 3),
+        "target": target,
+        "target_hits": int(row["hits"]),
+        "target_misses": int(row["misses"]),
+        "target_requests": int(row["requests"]),
+        "target_query_hit_ratio": round(float(row["query_hit_ratio"]), 4),
+        "predecessor": pred["query_id"] if pred else None,
+        "successor": succ["query_id"] if succ else None,
+        "two_before": pred2["query_id"] if pred2 else None,
+        "one_before": pred["query_id"] if pred else None,
+    }
+    if edge_in is not None:
+        info["edge_into_target"] = {
+            "prev_query": edge_in["prev_query"],
+            "D_pred_target": int(edge_in["D_ij"]),
+            "M_pred_target": int(edge_in["M"]),
+            "D_target_pred": int(edge_in["D_ji"]),
+            "D_norm": round(float(edge_in["D_norm"]), 4),
+            "M_norm": round(float(edge_in["M_norm"]), 4),
+            "survivor_ratio": round(float(edge_in["survivor_ratio"]), 4),
+            "gap_norm": round(float(edge_in["gap_norm"]), 4),
+            "size_norm_target": round(float(edge_in["size_norm_j"]), 4),
+            "cache_pressure_target": round(float(edge_in["cache_pressure_j"]), 4),
+            "out_D_topK_target": round(float(edge_in["out_D_topK_j"]), 4),
+            "balance_D_target": round(float(edge_in["balance_D_j"]), 4),
+        }
+    if edge_out is not None:
+        info["edge_out_of_target"] = {
+            "next_query": edge_out["next_query"],
+            "D_target_next": int(edge_out["D_ij"]),
+            "survivor_ratio": round(float(edge_out["survivor_ratio"]), 4),
+        }
+
+    # heuristic classification
+    flags = []
+    ei = info.get("edge_into_target")
+    if ei:
+        if ei["survivor_ratio"] < 0.15:
+            flags.append("weak_predecessor_handoff")  # little of pred survives into target
+        if ei["D_norm"] < 0.3:
+            flags.append("low_immediate_D_into_target")
+        if ei["cache_pressure_target"] > 0.9:
+            flags.append("target_exceeds_cache")  # huge query, mostly misses regardless
+    if info["relative_position"] < 0.25:
+        flags.append("placed_early")
+    elif info["relative_position"] > 0.75:
+        flags.append("placed_late")
+    if info["target_query_hit_ratio"] < 0.05:
+        flags.append("almost_all_misses")
+    info["classification"] = flags
+    return info
+
+
+def autopsy_compare(neigh_d: Path, bo_d: Path, target: str) -> dict:
+    """Side-by-side autopsy of *target* in the neighbor and BoTorch runs."""
+    n = query_autopsy(neigh_d, target)
+    b = query_autopsy(bo_d, target)
+    out = {"target": target, "neighbor": n, "botorch": b}
+    if n.get("available") and b.get("available"):
+        out["hit_delta_bo_minus_neigh"] = b["target_hits"] - n["target_hits"]
+        out["position_shift"] = b["position"] - n["position"]
+        ni = n.get("edge_into_target", {})
+        bi = b.get("edge_into_target", {})
+        if ni and bi:
+            out["survivor_into_target"] = {
+                "neighbor": ni["survivor_ratio"],
+                "botorch": bi["survivor_ratio"],
+            }
+            out["D_norm_into_target"] = {
+                "neighbor": ni["D_norm"], "botorch": bi["D_norm"],
+            }
+            out["predecessor"] = {
+                "neighbor": ni["prev_query"], "botorch": bi["prev_query"],
+            }
+    return out
+
+
 def per_query_audit(neigh_d: Path, bo_d: Path) -> dict:
     nid, bid = _incumbent_eval_id(neigh_d), _incumbent_eval_id(bo_d)
     if not nid or not bid:
@@ -328,7 +446,8 @@ def timing_audit(d: Path) -> dict:
 # ---------- orchestration ----------
 
 def analyze_cell(arms_dir: Path, baseline_dir: Path, cell: str,
-                 cache: int, family: str, consumer: str) -> dict:
+                 cache: int, family: str, consumer: str,
+                 autopsy_target: str | None = None) -> dict:
     dirs = {arm: _latest(arms_dir, cell, arm) for arm in ARMS}
     report: dict = {"cell": cell, "cache_pages": cache, "family": family,
                     "consumer": consumer, "arms_present": {}}
@@ -375,6 +494,10 @@ def analyze_cell(arms_dir: Path, baseline_dir: Path, cell: str,
     if neigh_d and bo_d:
         report["per_query_audit"] = per_query_audit(neigh_d, bo_d)
         report["edge_audit"] = edge_audit(neigh_d, bo_d)
+        # q3 autopsy: the small-cache D cell lost 102K hits on q3.
+        if autopsy_target:
+            report["query_autopsy"] = autopsy_compare(
+                neigh_d, bo_d, autopsy_target)
 
     # 4-6. per-arm config/surface/timing
     report["config_audit"] = {a: config_audit(d) for a, d in dirs.items() if d}
@@ -430,6 +553,10 @@ def main(argv=None) -> None:
                    default=Path("experiment_logs/bo"))
     p.add_argument("--out-dir", type=Path,
                    default=Path("experiment_logs/mode_a_forensics"))
+    p.add_argument("--autopsy-cell", default="c102400_d_msg",
+                   help="cell to run the per-query autopsy on")
+    p.add_argument("--autopsy-query", default="q3",
+                   help="query id to autopsy (default q3)")
     args = p.parse_args(argv)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -438,8 +565,11 @@ def main(argv=None) -> None:
     print("MODE A FORENSIC AUDIT — botorch vs neighbor (and arms/baselines)")
     print("=" * 78)
     for cell, cache, family, consumer in CELLS:
+        # q3 autopsy only for the small-cache D multistart cell where the
+        # 102K-hit loss occurred (configurable via --autopsy-cell/query).
+        tgt = args.autopsy_query if cell == args.autopsy_cell else None
         rep = analyze_cell(args.arms_dir, args.baseline_dir,
-                           cell, cache, family, consumer)
+                           cell, cache, family, consumer, autopsy_target=tgt)
         (args.out_dir / f"{cell}_forensics.json").write_text(
             json.dumps(rep, indent=2))
         print("\n" + _verdict_line(rep))
@@ -465,6 +595,25 @@ def main(argv=None) -> None:
                   f"acq_best={ca['botorch_acq_best_F']} "
                   f"acq>init={ca['botorch_acq_improved_over_init']} "
                   f"dup_configs={ca['duplicate_config_proposals']}")
+
+        qa = rep.get("query_autopsy")
+        if qa and qa.get("neighbor", {}).get("available") \
+                and qa.get("botorch", {}).get("available"):
+            t = qa["target"]
+            nn, bb = qa["neighbor"], qa["botorch"]
+            print(f"    [{t} AUTOPSY] hit_delta(bo-neigh)={qa['hit_delta_bo_minus_neigh']} "
+                  f"pos_shift={qa['position_shift']}")
+            print(f"        neighbor: pos={nn['position']}/{nn['n_queries']-1} "
+                  f"pred={nn['predecessor']} hits={nn['target_hits']} "
+                  f"miss={nn['target_misses']} class={nn['classification']}")
+            print(f"        botorch : pos={bb['position']}/{bb['n_queries']-1} "
+                  f"pred={bb['predecessor']} hits={bb['target_hits']} "
+                  f"miss={bb['target_misses']} class={bb['classification']}")
+            if "survivor_into_target" in qa:
+                print(f"        survivor into {t}: neigh={qa['survivor_into_target']['neighbor']} "
+                      f"bo={qa['survivor_into_target']['botorch']}  |  "
+                      f"D_norm into {t}: neigh={qa['D_norm_into_target']['neighbor']} "
+                      f"bo={qa['D_norm_into_target']['botorch']}")
 
         # accumulate summary row
         f = rep["best_F_hit"]
