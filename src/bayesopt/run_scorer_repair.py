@@ -199,13 +199,18 @@ def _classify_survivors(
                       if h <= Q3_RECOVERY_THRESHOLD)
 
     robust, regime = [], {}
+    robust_detail = {}
     for v in per_variant:
         gd = deltas(v, "vs_greedy_d")
         gad = deltas(v, "vs_ga_d")
         do = deltas(v, "vs_d_only")
-        beats_gd_all = len(gd) == n_caches and all(x > 0 for x in gd)
-        beats_gad_2 = sum(1 for x in gad if x > 0) >= 2
-        ge_donly_2 = sum(1 for x in do if x >= -1e-6) >= 2
+        # A "win" must clear the baseline by a meaningful margin (>= 1e-4,
+        # i.e. 0.01pp); deltas inside ±1e-4 are ties, not wins, so a
+        # display-rounded +0.0000 cannot masquerade as a win.
+        WIN_MARGIN = 1e-4
+        beats_gd_all = len(gd) == n_caches and all(x > WIN_MARGIN for x in gd)
+        beats_gad_2 = sum(1 for x in gad if x > WIN_MARGIN) >= 2
+        ge_donly_2 = sum(1 for x in do if x >= -WIN_MARGIN) >= 2
         # q3: if variant was autopsied, require recovery; if not autopsied
         # (q3 not in workload), treat as not-disqualifying.
         q3_ok = q3_hits.get(v, Q3_RECOVERY_THRESHOLD + 1) > Q3_RECOVERY_THRESHOLD
@@ -213,6 +218,12 @@ def _classify_survivors(
         if (beats_gd_all and beats_gad_2 and ge_donly_2 and q3_ok
                 and no_catastrophe):
             robust.append(v)
+            robust_detail[v] = {
+                "beats_greedy_d": sum(1 for x in gd if x > WIN_MARGIN),
+                "beats_ga_d": sum(1 for x in gad if x > WIN_MARGIN),
+                "ge_d_only": sum(1 for x in do if x >= -WIN_MARGIN),
+                "q3_hits": q3_hits.get(v),
+            }
 
     # regime specialists: best or within 0.2pp of best at a cache, q3-safe
     regime_lists: dict[str, list[str]] = {}
@@ -235,6 +246,7 @@ def _classify_survivors(
             "q3_recovery_threshold": Q3_RECOVERY_THRESHOLD,
         },
         "robust_survivors": sorted(robust),
+        "robust_detail": robust_detail,
         "regime_survivors": regime_lists,
         "q3_safe_variants": q3_safe,
         "q3_breaking_variants": q3_break,
