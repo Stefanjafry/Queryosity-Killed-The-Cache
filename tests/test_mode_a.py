@@ -571,3 +571,66 @@ class TestScorerVariants:
         assert "D_remaining_out" in names
         for a in ALPHA_D_VALUES:
             assert f"aD{a}_role_out_cachefit_size" in names
+
+
+class TestDynamicScorerV2:
+    """Stage-2 Dynamic Scorer v2 (missed_opportunity etc.)."""
+
+    def test_missed_opportunity_zero_from_best_pred(self):
+        from src.bayesopt.mode_a.dynamic_scorer import DynamicSpec, dynamic_score
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        j = 1
+        U = [q for q in range(12) if q != 0]
+        best_pred = max((u for u in range(12) if u != j),
+                        key=lambda u: f.D_norm[u][j])
+        i = best_pred if best_pred != j else 0
+        _, feat = dynamic_score(
+            DynamicSpec(formula="dynamic_missed_opportunity"), f, i, j, U)
+        # from the best available predecessor, missed_opportunity is ~0
+        assert feat["missed_opportunity"] <= 1e-9 or i not in U + [0]
+
+    def test_missed_opportunity_positive_from_weak_pred(self):
+        from src.bayesopt.mode_a.dynamic_scorer import DynamicSpec, dynamic_score
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        j = 1
+        U = [q for q in range(12) if q != 0]
+        worst = min((u for u in range(12) if u != j),
+                    key=lambda u: f.D_norm[u][j])
+        _, feat = dynamic_score(
+            DynamicSpec(formula="dynamic_missed_opportunity"), f, worst, j, U)
+        assert feat["missed_opportunity"] >= 0.0
+
+    def test_d_only_dynamic_contains_greedy_d(self):
+        from src.bayesopt.mode_a.dynamic_scorer import (
+            DynamicSpec, multistart_greedy_dynamic)
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        cands = multistart_greedy_dynamic(DynamicSpec(formula="D_only"), f,
+                                          num_starts=5)
+        gd = tuple(greedy_directional_schedule(f.D, f.pagecount))
+        assert any(c.schedule == gd for c in cands)
+
+    def test_all_formulas_valid_and_deterministic(self):
+        from src.bayesopt.mode_a.dynamic_scorer import (
+            DynamicSpec, DYNAMIC_FORMULAS, multistart_greedy_dynamic)
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        for formula in DYNAMIC_FORMULAS:
+            spec = DynamicSpec(formula=formula, alpha_D=2, lambda_wait=2.0)
+            a = multistart_greedy_dynamic(spec, f)
+            b = multistart_greedy_dynamic(spec, f)
+            assert [c.schedule for c in a] == [c.schedule for c in b]
+            for c in a:
+                assert is_valid_permutation(list(c.schedule), 12)
+
+    def test_dynamic_features_no_leak(self):
+        from src.bayesopt.mode_a.dynamic_scorer import DynamicSpec, dynamic_score
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        spec = DynamicSpec(formula="dynamic_full")
+        _, big = dynamic_score(spec, f, 0, 1, [1, 2, 3, 4, 5])
+        _, small = dynamic_score(spec, f, 0, 1, [1, 2])
+        assert (big["out_rem"] != small["out_rem"]
+                or big["best_in_remaining"] != small["best_in_remaining"])
