@@ -153,6 +153,111 @@ def evaluate_cache(
                                               "d_only": d_only_fhit}
 
 
+Q3_RECOVERY_THRESHOLD = 50_000     # q3_hits above this = handoff recovered
+CATASTROPHE = -0.005               # vs a fair baseline, worse than this = bad
+
+
+def _classify_survivors(
+    per_variant: dict[str, dict[int, dict]],
+    q3_hits: dict[str, int],
+    caches: list[int],
+    autopsy_cache: int,
+) -> dict:
+    """
+    Classify variants into the two survivor categories (vs direct-eval
+    baselines greedy_d / ga_d / D_only), plus regime specialists and
+    q3-safety lists.
+
+    Category 1 (robust): beats greedy_d at all caches, ga_d at >=2,
+    >= D_only at >=2, recovers q3 (hits > 50K), no catastrophic
+    regression at the remaining cache.
+
+    Category 2 (regime-specific): clearly best / near-best in one cache
+    regime and does not break q3.
+    """
+    n_caches = len(caches)
+
+    def deltas(v: str, key: str) -> list[float]:
+        out = []
+        for c in caches:
+            row = per_variant[v].get(c)
+            if row and row.get(key) is not None:
+                out.append(row[key])
+        return out
+
+    # per-cache best variant (for regime specialists)
+    best_at: dict[int, str] = {}
+    for c in caches:
+        best_at[c] = max(
+            (v for v in per_variant if c in per_variant[v]),
+            key=lambda v: per_variant[v][c]["F_hit"],
+        )
+
+    q3_safe = sorted(v for v, h in q3_hits.items()
+                     if h > Q3_RECOVERY_THRESHOLD)
+    q3_break = sorted(v for v, h in q3_hits.items()
+                      if h <= Q3_RECOVERY_THRESHOLD)
+
+    robust, regime = [], {}
+    for v in per_variant:
+        gd = deltas(v, "vs_greedy_d")
+        gad = deltas(v, "vs_ga_d")
+        do = deltas(v, "vs_d_only")
+        beats_gd_all = len(gd) == n_caches and all(x > 0 for x in gd)
+        beats_gad_2 = sum(1 for x in gad if x > 0) >= 2
+        ge_donly_2 = sum(1 for x in do if x >= -1e-6) >= 2
+        # q3: if variant was autopsied, require recovery; if not autopsied
+        # (q3 not in workload), treat as not-disqualifying.
+        q3_ok = q3_hits.get(v, Q3_RECOVERY_THRESHOLD + 1) > Q3_RECOVERY_THRESHOLD
+        no_catastrophe = all(x > CATASTROPHE for x in gd) if gd else True
+        if (beats_gd_all and beats_gad_2 and ge_donly_2 and q3_ok
+                and no_catastrophe):
+            robust.append(v)
+
+    # regime specialists: best or within 0.2pp of best at a cache, q3-safe
+    regime_lists: dict[str, list[str]] = {}
+    for c in caches:
+        top = per_variant[best_at[c]][c]["F_hit"]
+        near = [v for v in per_variant
+                if c in per_variant[v]
+                and per_variant[v][c]["F_hit"] >= top - 0.002
+                and q3_hits.get(v, Q3_RECOVERY_THRESHOLD + 1)
+                > Q3_RECOVERY_THRESHOLD]
+        label = ("small_cache" if c == min(caches)
+                 else "large_cache" if c == max(caches) else "middle_cache")
+        regime_lists[label] = sorted(near)
+
+    return {
+        "criterion": {
+            "robust": "beats greedy_d@all, ga_d@>=2, >=D_only@>=2, "
+                      "q3_hits>50K, no cache worse than -0.005 vs greedy_d",
+            "regime": "within 0.2pp of best at a cache AND q3_hits>50K",
+            "q3_recovery_threshold": Q3_RECOVERY_THRESHOLD,
+        },
+        "robust_survivors": sorted(robust),
+        "regime_survivors": regime_lists,
+        "q3_safe_variants": q3_safe,
+        "q3_breaking_variants": q3_break,
+        "best_at_cache": {str(c): best_at[c] for c in caches},
+    }
+
+
+def _print_classification(cls: dict, per_variant: dict, caches: list[int]):
+    print("=" * 70)
+    print("SURVIVOR CLASSIFICATION (vs direct-eval baselines)")
+    print("=" * 70)
+    print(f"\n  ROBUST survivors ({len(cls['robust_survivors'])}): "
+          f"{cls['robust_survivors']}")
+    print("\n  REGIME survivors:")
+    for regime, vs in cls["regime_survivors"].items():
+        print(f"    {regime:13s}: {vs}")
+    print(f"\n  q3-SAFE   ({len(cls['q3_safe_variants'])}): "
+          f"{cls['q3_safe_variants']}")
+    print(f"  q3-BREAK  ({len(cls['q3_breaking_variants'])}): "
+          f"{cls['q3_breaking_variants']}")
+    print(f"\n  best-at-cache: {cls['best_at_cache']}")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--page-access-dir", type=Path, required=True)
@@ -183,8 +288,8 @@ def main(argv=None) -> None:
           f"= {len(grid) * len(caches)} direct evaluations\n")
 
     all_rows = []
-    win_loss: dict[str, dict[str, int]] = {}
-    per_variant_fhit: dict[str, list[float]] = {}
+    per_variant: dict[str, dict[int, dict]] = {}  # variant -> cache -> row
+    q3_hits_by_variant: dict[str, int] = {}        # at the autopsy cache
     for cache in caches:
         tgt = args.autopsy_query if cache == args.autopsy_cache else None
         print(f"=== cache {cache} ===")
@@ -203,7 +308,7 @@ def main(argv=None) -> None:
         for r in ranked[:5]:
             print(f"    {r['variant']:30s} F={r['F_hit']:.4f} "
                   f"vsGD={_fmt(r['vs_greedy_d'])} vsGAD={_fmt(r['vs_ga_d'])} "
-                  f"vsNeigh={_fmt(r['vs_neighbor'])} avgDnorm={r['avg_D_norm']}")
+                  f"vsDonly={_fmt(r['vs_d_only'])} avgDnorm={r['avg_D_norm']}")
         if autopsy:
             print(f"  q3 autopsy (cache {cache}):")
             for a in sorted(autopsy, key=lambda x: -x["q3_hits"])[:3]:
@@ -213,18 +318,12 @@ def main(argv=None) -> None:
             worst = min(autopsy, key=lambda x: x["q3_hits"])
             print(f"    WORST q3: {worst['variant']} hits={worst['q3_hits']} "
                   f"pred={worst['q3_predecessor']} Dinto={worst['D_norm_into_q3']}")
+            for a in autopsy:
+                q3_hits_by_variant[a["variant"]] = a["q3_hits"]
         for r in rows:
             r["cache"] = cache
             all_rows.append(r)
-            per_variant_fhit.setdefault(r["variant"], []).append(r["F_hit"])
-            wl = win_loss.setdefault(r["variant"], {"win": 0, "tie": 0, "loss": 0})
-            if r["vs_neighbor"] is not None:
-                if r["vs_neighbor"] > 1e-6:
-                    wl["win"] += 1
-                elif r["vs_neighbor"] < -1e-6:
-                    wl["loss"] += 1
-                else:
-                    wl["tie"] += 1
+            per_variant.setdefault(r["variant"], {})[cache] = r
         print()
 
     # summary CSV
@@ -236,31 +335,12 @@ def main(argv=None) -> None:
         for r in all_rows:
             w.writerow({k: r.get(k) for k in keys})
 
-    # win/loss + largest regression per variant, survivor list
-    print("=" * 70)
-    print("CROSS-CACHE SUMMARY (vs neighbor)")
-    print("=" * 70)
-    survivors = []
-    for variant in sorted(per_variant_fhit):
-        wl = win_loss[variant]
-        regs = [r["vs_neighbor"] for r in all_rows
-                if r["variant"] == variant and r["vs_neighbor"] is not None]
-        largest_reg = min(regs) if regs else None
-        best_imp = max(regs) if regs else None
-        # survivor: never catastrophically regresses and wins/ties somewhere
-        survivor = (largest_reg is not None and largest_reg > -0.005
-                    and wl["win"] >= 1)
-        if survivor:
-            survivors.append(variant)
-        print(f"  {variant:30s} W/T/L={wl['win']}/{wl['tie']}/{wl['loss']} "
-              f"bestΔ={_fmt(best_imp)} worstΔ={_fmt(largest_reg)}"
-              f"{'  <-- survivor' if survivor else ''}")
+    classification = _classify_survivors(
+        per_variant, q3_hits_by_variant, caches, args.autopsy_cache)
+    _print_classification(classification, per_variant, caches)
 
-    (args.out_dir / "survivors.json").write_text(json.dumps({
-        "survivors": survivors,
-        "criterion": "worst vs_neighbor > -0.005 AND >=1 win across caches",
-    }, indent=2))
-    print(f"\nSurvivors ({len(survivors)}): {survivors}")
+    (args.out_dir / "survivors.json").write_text(
+        json.dumps(classification, indent=2))
     print(f"\nWrote scorer_repair_summary.csv, per-cache JSON, survivors.json "
           f"to {args.out_dir}")
 
