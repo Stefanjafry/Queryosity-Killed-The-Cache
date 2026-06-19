@@ -495,3 +495,79 @@ class TestBotorchBackend:
             output_dir=tmp_path / "b")
         assert a.best_cost == b.best_cost
         assert a.best_schedule_qids == b.best_schedule_qids
+
+
+class TestScorerVariants:
+    """Stage-2 scorer-repair variants (Track 4)."""
+
+    def test_pure_d_variant_contains_greedy_d(self):
+        from src.bayesopt.mode_a.scorer_variants import (
+            VariantSpec, multistart_greedy_variant)
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        cands = multistart_greedy_variant(VariantSpec(name="D_only"), f,
+                                          num_starts=5)
+        gd = tuple(greedy_directional_schedule(f.D, f.pagecount))
+        assert any(c.schedule == gd for c in cands)
+
+    def test_dynamic_features_use_only_remaining(self):
+        # out_rem must change as the remaining set shrinks (no static leak).
+        from src.bayesopt.mode_a.scorer_variants import VariantSpec, variant_score
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        spec = VariantSpec(name="t", use_remaining_out=True)
+        _, d_full = variant_score(spec, f, 0, 1, [q for q in range(12) if q != 0])
+        _, d_small = variant_score(spec, f, 0, 1, [1, 2, 3])
+        assert d_full["out_rem"] != d_small["out_rem"]
+
+    def test_producer_gate_bounded(self):
+        from src.bayesopt.mode_a.scorer_variants import VariantSpec, variant_score
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        U = [q for q in range(12) if q != 0]
+        for j in U:
+            _, diag = variant_score(
+                VariantSpec(name="t", use_role_out=True), f, 0, j, U)
+            assert 0.0 <= diag["producer_gate"] <= 1.0
+            assert diag["role_out"] >= 0.0
+
+    def test_cache_fit_range(self):
+        from src.bayesopt.mode_a.scorer_variants import VariantSpec, variant_score, cache_fit
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        for j in range(12):
+            assert 0.0 < cache_fit(f, j) <= 1.0
+
+    def test_alpha_only_is_noop(self):
+        # Scaling the sole term by a constant cannot change the argmax.
+        from src.bayesopt.mode_a.scorer_variants import (
+            VariantSpec, multistart_greedy_variant)
+        ps, _ = _workload(n=10)
+        f = build_features(ps, CACHE)
+        a = multistart_greedy_variant(VariantSpec(name="d", alpha_D=1), f)
+        b = multistart_greedy_variant(VariantSpec(name="d", alpha_D=5), f)
+        assert [c.schedule for c in a] == [c.schedule for c in b]
+
+    def test_variant_determinism(self):
+        from src.bayesopt.mode_a.scorer_variants import (
+            VariantSpec, multistart_greedy_variant)
+        ps, _ = _workload(n=12)
+        f = build_features(ps, CACHE)
+        spec = VariantSpec(name="t", alpha_D=2, use_role_out=True,
+                           use_size=True, cache_fit_on_future=True)
+        a = multistart_greedy_variant(spec, f)
+        b = multistart_greedy_variant(spec, f)
+        assert [c.schedule for c in a] == [c.schedule for c in b]
+        for c in a:
+            assert is_valid_permutation(list(c.schedule), 12)
+
+    def test_grid_size_and_alpha_coverage(self):
+        from src.bayesopt.mode_a.scorer_variants import (
+            default_variant_grid, ALPHA_D_VALUES)
+        grid = default_variant_grid()
+        names = {v.name for v in grid}
+        assert "D_only" in names
+        assert "D_role_out" in names
+        assert "D_remaining_out" in names
+        for a in ALPHA_D_VALUES:
+            assert f"aD{a}_role_out_cachefit_size" in names
