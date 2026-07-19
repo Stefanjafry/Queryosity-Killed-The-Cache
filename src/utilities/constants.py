@@ -11,10 +11,12 @@ WORKLOAD_DIRS = {
     "tpch": WORKLOAD_ROOT / "tpch",
     "tpcds": WORKLOAD_ROOT / "tpcds",
     "job": WORKLOAD_ROOT / "job",
+    "dsb": WORKLOAD_ROOT / "dsb",
 }
 
 DB_DEFAULTS = {
     "tpch": "tpch",
     "tpcds": "tpcds",
     "job": "imdb",
+    "dsb": "dsb",
 }

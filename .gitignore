@@ -16,3 +16,12 @@ page_access/
 experiment_logs/
 plots/
 *.patch
+
+# robust pycache + throwaway
+**/__pycache__/
+*.pyc
+split_diag.py
+
+# DSB (out of paper, not committed)
+workloads/dsb/
+workloads/dsb_agg_backup/

@@ -42,6 +42,7 @@ from src.utilities.constants import WORKLOAD_DIRS
 ALL_METHODS = [
     "random", "greedy_M", "greedy_D", "multistart_M", "multistart_D",
     "beam_M", "beam_D", "windowed_greedy_M", "GA_M", "GA_D", "BO_M", "BO_D",
+    "sweep_D", "sweep_beam_D",
 ]
 
 
@@ -55,6 +56,9 @@ def main(argv: list[str] | None = None) -> None:
                    help=f"comma-separated subset of: {','.join(ALL_METHODS)}")
     p.add_argument("--num-starts", type=int, default=4)
     p.add_argument("--beam-width", type=int, default=4)
+    p.add_argument("--regret-grid", default="",
+                   help="w_regret sweep grid; blank = default fine grid.")
+    p.add_argument("--sweep-beam-widths", default="2,3,4")
     p.add_argument("--ga-pop", type=int, default=100)
     p.add_argument("--ga-gen", type=int, default=200)
     p.add_argument("--bo-backend", default="neighbor")
@@ -126,6 +130,37 @@ def main(argv: list[str] | None = None) -> None:
             return compute_baseline_schedule(key, wp.page_sets, wp.query_ids, D,
                                              args.cache_pages, args.seed,
                                              args.ga_pop, args.ga_gen)
+        if method == "sweep_D":
+            grid = ([float(x) for x in args.regret_grid.split(",") if x.strip()]
+                    if args.regret_grid.strip()
+                    else [round(0.1 * i, 1) for i in range(11)] + [1.5, 2.0])
+            starts = good_start_set(D_norm, pc, args.num_starts)
+            best_s: list[int] = []
+            best_f = -1.0
+            for wr in grid:
+                sc = make_step_scorer(D_norm, ScorerWeights(w_regret=wr), pc,
+                                      args.cache_pages)
+                cand = best_sched(multistart_greedy_schedules(sc, n, pc, starts))
+                f = fhit(cand)
+                if f > best_f:
+                    best_f, best_s = f, cand
+            return best_s
+        if method == "sweep_beam_D":
+            grid = ([float(x) for x in args.regret_grid.split(",") if x.strip()]
+                    if args.regret_grid.strip()
+                    else [round(0.1 * i, 1) for i in range(11)] + [1.5, 2.0])
+            widths = [int(b) for b in args.sweep_beam_widths.split(",") if b.strip()]
+            best_s2: list[int] = []
+            best_f2 = -1.0
+            for wr in grid:
+                sc = make_step_scorer(D_norm, ScorerWeights(w_regret=wr), pc,
+                                      args.cache_pages)
+                for bw in widths:
+                    cand = best_sched(beam_search_schedule(sc, n, pc, bw))
+                    f = fhit(cand)
+                    if f > best_f2:
+                        best_f2, best_s2 = f, cand
+            return best_s2
         if method in ("BO_M", "BO_D"):
             return bo_best_schedule(M_norm if method.endswith("M") else D_norm)
         raise SystemExit(f"unhandled method {method}")
