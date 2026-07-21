@@ -48,7 +48,7 @@ isolates the consumer (same matrix).
 > scorer tuning (SMAC / BoTorch), the Mode A structured search, residual
 > and windowing ablations, and their runners and tests — is preserved
 > unchanged on the branch this one was cut from
-> (`feat/residual-window-bo`). BO was retired after the tuned auxiliary
+> (`archive/experiments`). BO was retired after the tuned auxiliary
 > weights collapsed to zero in 8/9 configurations, leaving `w_regret` as
 > the only active dimension; the exhaustive sweep matches BO within
 > measurement noise while being deterministic. This branch contains only
