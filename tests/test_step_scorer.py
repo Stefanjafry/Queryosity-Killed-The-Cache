@@ -142,15 +142,6 @@ def test_net_reuse_gap_reads_both_matrices() -> None:
     assert abs(net_reuse_gap(0, [0, 1, 2], D, M) - 0.1) < 1e-9
 
 
-def test_net_reuse_gap_reads_both_matrices() -> None:
-    from src.bayesopt.step_scorer import net_reuse_gap
-    n = 3
-    D = [[0.0, 0.3, 0.2], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-    M = [[0.0, 0.5, 0.4], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-    # sum_k D[0][k] - (M[0][k]-D[0][k]) = (0.3-0.2)+(0.2-0.2) = 0.1
-    assert abs(net_reuse_gap(0, [0, 1, 2], D, M) - 0.1) < 1e-9
-
-
 def test_multistart_runs_from_distinct_starts() -> None:
     from src.bayesopt.step_scorer import (
         good_start_set, multistart_greedy_schedules)

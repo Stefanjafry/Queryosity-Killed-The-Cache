@@ -8,8 +8,9 @@ the same seed — and writes them as query-id strings in the format
 
     {"cache_label": "<cache>", "schedules": {"<method>": "q1,q3,q2,...", ...}}
 
-Pick the few schedules that carry the paper claim (e.g. GA_M baseline vs
-greedy_D / GA_D / BO_D) rather than all twelve — real runs are ~20 min each.
+Methods are the four the paper compares — GA_M (Queryosity baseline),
+GA_D, sweep_D, sweep_beam_D — plus a seeded random floor. Real runs are
+~20 min each, so export only the schedules a given experiment needs.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import json
 import random
 from pathlib import Path
 
-from src.bayesopt.bo_tuner import run_search, weights_from_vec
 from src.bayesopt.data import load_workload_pages
 from src.bayesopt.objective import ExactSimObjective
 from src.bayesopt.run_baselines import compute_baseline_schedule
@@ -27,23 +27,14 @@ from src.bayesopt.step_scorer import (
     ScorerWeights,
     beam_search_schedule,
     good_start_set,
-    greedy_schedule,
     make_step_scorer,
     multistart_greedy_schedules,
     row_normalize,
 )
-from src.bayesopt.windowed_scorer import greedy_windowed_schedule
-from src.simulator.cache_simulator import (
-    compute_directional_matrix,
-    compute_overlap_matrix,
-)
+from src.simulator.cache_simulator import compute_directional_matrix
 from src.utilities.constants import WORKLOAD_DIRS
 
-ALL_METHODS = [
-    "random", "greedy_M", "greedy_D", "multistart_M", "multistart_D",
-    "beam_M", "beam_D", "windowed_greedy_M", "GA_M", "GA_D", "BO_M", "BO_D",
-    "sweep_D", "sweep_beam_D",
-]
+ALL_METHODS = ["random", "GA_M", "GA_D", "sweep_D", "sweep_beam_D"]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -52,18 +43,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--cache-pages", type=int, required=True)
     p.add_argument("--page-access-dir", type=Path, required=True)
     p.add_argument("--exclude", default="")
-    p.add_argument("--methods", default="GA_M,greedy_D,GA_D,BO_D",
+    p.add_argument("--methods", default="GA_M,GA_D,sweep_D,sweep_beam_D",
                    help=f"comma-separated subset of: {','.join(ALL_METHODS)}")
     p.add_argument("--num-starts", type=int, default=4)
-    p.add_argument("--beam-width", type=int, default=4)
     p.add_argument("--regret-grid", default="",
                    help="w_regret sweep grid; blank = default fine grid.")
     p.add_argument("--sweep-beam-widths", default="2,3,4")
     p.add_argument("--ga-pop", type=int, default=100)
     p.add_argument("--ga-gen", type=int, default=200)
-    p.add_argument("--bo-backend", default="neighbor")
-    p.add_argument("--bo-budget", type=int, default=60)
-    p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args(argv)
@@ -77,9 +64,7 @@ def main(argv: list[str] | None = None) -> None:
     wp = load_workload_pages(args.page_access_dir, exclude=exclude)
     n = wp.n
     pc = [len(ps) for ps in wp.page_sets]
-    M = compute_overlap_matrix(wp.page_sets)
     D = compute_directional_matrix(wp.page_sets, args.cache_pages)
-    M_norm = row_normalize(M)
     D_norm = row_normalize(D)
     obj = ExactSimObjective(wp.page_sets, args.cache_pages, d_matrix=D)
 
@@ -90,41 +75,12 @@ def main(argv: list[str] | None = None) -> None:
     def best_sched(scheds: list[list[int]]) -> list[int]:
         return max(scheds, key=fhit)
 
-    def bo_best_schedule(immediate: list[list[float]]) -> list[int]:
-        starts = good_start_set(immediate, pc, args.num_starts)
-
-        def objective(w: ScorerWeights) -> tuple[float, int]:
-            sc = make_step_scorer(immediate, w, pc, args.cache_pages)
-            ms = multistart_greedy_schedules(sc, n, pc, starts)
-            return max(fhit(s) for s in ms), len(ms)
-
-        res = run_search(objective, args.bo_backend, args.bo_budget,
-                         patience=args.patience, seed=args.seed, cache_mode="fit")
-        w = weights_from_vec(res.best_vec, "fit")
-        sc = make_step_scorer(immediate, w, pc, args.cache_pages)
-        return best_sched(multistart_greedy_schedules(sc, n, pc, starts))
-
     def schedule_for(method: str) -> list[int]:
         if method == "random":
             rng = random.Random(args.seed)
             perm = list(range(n))
             rng.shuffle(perm)
             return perm
-        if method in ("greedy_M", "greedy_D"):
-            imm = M_norm if method.endswith("M") else D_norm
-            return greedy_schedule(make_step_scorer(imm, ScorerWeights(), pc,
-                                                    args.cache_pages), n, pc)
-        if method in ("multistart_M", "multistart_D"):
-            imm = M_norm if method.endswith("M") else D_norm
-            starts = good_start_set(imm, pc, args.num_starts)
-            sc = make_step_scorer(imm, ScorerWeights(), pc, args.cache_pages)
-            return best_sched(multistart_greedy_schedules(sc, n, pc, starts))
-        if method in ("beam_M", "beam_D"):
-            imm = M_norm if method.endswith("M") else D_norm
-            sc = make_step_scorer(imm, ScorerWeights(), pc, args.cache_pages)
-            return best_sched(beam_search_schedule(sc, n, pc, args.beam_width))
-        if method == "windowed_greedy_M":
-            return greedy_windowed_schedule(M, pc, args.cache_pages)
         if method in ("GA_M", "GA_D"):
             key = "ga_m" if method.endswith("M") else "ga_d"
             return compute_baseline_schedule(key, wp.page_sets, wp.query_ids, D,
@@ -161,8 +117,6 @@ def main(argv: list[str] | None = None) -> None:
                     if f > best_f2:
                         best_f2, best_s2 = f, cand
             return best_s2
-        if method in ("BO_M", "BO_D"):
-            return bo_best_schedule(M_norm if method.endswith("M") else D_norm)
         raise SystemExit(f"unhandled method {method}")
 
     schedules: dict[str, str] = {}

@@ -1,524 +1,579 @@
-# "Queryosity Killed The Cache" Query Scheduler
- 
-This repository contains the code and workloads used for the EECS 6414 (W2026)
-course project. It implements a cache-aware query scheduler on top of
-PostgreSQL 16, using a genetic algorithm (GA) over a clock-sweep buffer-pool
-simulator to find query execution orders that maximize shared-buffer hit
-ratio. A DQN-based "SmartQueue" baseline is provided for comparison.
+# Queryosity Killed The Cache — Directional Query Scheduling
 
-This README is a complete reproduction guide. Following it end-to-end will
-get you from a blank machine to trained models, optimized schedules,
-real-database execution numbers, and publication-ready plots.
+Buffer-aware query scheduling for PostgreSQL 16, extending the
+"Queryosity Killed The Cache" scheduler (Dolores, Ruparelia, Di Giovanni;
+EECS 6414, York University). The original system reorders a batch of OLAP
+queries with a genetic algorithm over a **symmetric** pairwise page-overlap
+matrix `M[i][j] = |P(Qi) ∩ P(Qj)|` so that queries sharing pages run
+back-to-back and reuse each other's buffer contents.
+
+This branch adds and evaluates a **directional utility matrix**
+
+```
+D[i][j] = |R(Qi; C) ∩ P(Qj)|
+```
+
+where `R(Qi; C)` is the set of Qi's pages that *survive* clock-sweep
+eviction at cache capacity `C`. `D` is asymmetric and cache-size-aware:
+it measures what a predecessor actually leaves behind for a successor,
+not what the two queries share on paper. Two invariants hold by
+construction: `D[i][j] ≤ M[i][j]` pointwise, with equality exactly when
+no eviction occurs — so `D` collapses to `M` when the working set fits
+in cache, and diverges from it under eviction pressure, which is
+precisely where scheduling decisions matter.
+
+The schedule *consumer* changes too. Instead of a GA, the directional
+matrix is consumed by a deterministic **1-D regret sweep**: a single
+weight `w_regret` is swept over a fixed 13-point grid
+`{0.0, 0.1, …, 1.0, 1.5, 2.0}`; each grid point parameterizes a greedy
+step scorer, candidate schedules are built by multistart-greedy (K=4
+starts) and beam search (widths 2/3/4), and every candidate is scored by
+the exact clock-sweep simulator. The best candidate wins. There is no
+training, no tuning of the search itself, and no seed dependence — the
+same inputs always produce the same schedule.
+
+**Methods compared in the paper** (all re-scored by the exact simulator):
+
+| Method | Matrix | Consumer |
+|---|---|---|
+| `GA_M` | symmetric `M`, windowed fitness | genetic algorithm (Queryosity baseline) |
+| `GA_D` | directional `D`, single-step edge-sum fitness | genetic algorithm |
+| `sweep_D` | directional `D` | regret sweep → multistart-greedy (K=4) |
+| `sweep_beam_D` | directional `D` | regret sweep → beam search (widths 2/3/4) |
+
+`GA_M → GA_D` isolates the matrix (same consumer); `GA_D → sweep_*`
+isolates the consumer (same matrix).
+
+> **Archive branch.** Earlier experimental code — Bayesian-optimization
+> scorer tuning (SMAC / BoTorch), the Mode A structured search, residual
+> and windowing ablations, and their runners and tests — is preserved
+> unchanged on the branch this one was cut from
+> (`feat/residual-window-bo`). BO was retired after the tuned auxiliary
+> weights collapsed to zero in 8/9 configurations, leaving `w_regret` as
+> the only active dimension; the exhaustive sweep matches BO within
+> measurement noise while being deterministic. This branch contains only
+> the code the demo paper uses.
 
 ---
 
 ## Pipeline Overview
 
 ```
-           ┌──────────────────────┐
-           │  Docker + Postgres   │  (Section 1)
-           └─────────┬────────────┘
-                     │
-           ┌─────────▼────────────┐
-           │  Benchmark loaders   │  TPC-H · TPC-DS · JOB/IMDB
-           │  (tpch/tpcds/job)    │  (Section 2)
-           └─────────┬────────────┘
-                     │
-           ┌─────────▼────────────┐
-           │  Page profiler       │  pg_buffercache → CSV
-           │  (src.profiler)      │  (Section 3)
-           └─────────┬────────────┘
-                     │
-      ┌──────────────┴───────────────┐
-      │                              │
-┌─────▼──────────┐          ┌────────▼────────────┐
-│  GA scheduler  │          │  DQN (SmartQueue)   │
-│ (src.scheduler)│          │  ml/dqn.ipynb       │
-└─────┬──────────┘          └────────┬────────────┘
-      │                              │
-      └──────────────┬───────────────┘
-                     │
-           ┌─────────▼────────────┐
-           │  Executor (real PG)  │  EXPLAIN (ANALYZE, BUFFERS)
-           │  (src.executor)      │  (Section 6)
-           └─────────┬────────────┘
-                     │
-           ┌─────────▼────────────┐
-           │  Visualizations      │  (Section 7)
-           │  (src.visualization) │
-           └──────────────────────┘
+            ┌───────────────────────┐
+            │ PostgreSQL 16         │  Docker (§2) or native (§2.4)
+            └──────────┬────────────┘
+                       │
+            ┌──────────▼────────────┐
+            │ Benchmark loaders     │  TPC-H · TPC-DS · JOB/IMDB (§3)
+            └──────────┬────────────┘
+                       │
+            ┌──────────▼────────────┐
+            │ Page profiler         │  pg_buffercache → CSV (§4)
+            │ (src.profiler)        │  ── profiles for all three workloads
+            └──────────┬────────────┘     are ALREADY SHIPPED in page_access/
+                       │
+            ┌──────────▼────────────┐
+            │ M and D matrices +    │  simulator-only; no database needed
+            │ schedulers (§5)       │  run_regret_sweep · run_baselines
+            └──────────┬────────────┘
+                       │
+            ┌──────────▼────────────┐
+            │ export_schedules (§6) │  frozen orderings → JSON
+            └──────────┬────────────┘
+                       │
+            ┌──────────▼────────────┐
+            │ Wall-clock runs (§7)  │  run_sweep on real Postgres
+            └──────────┬────────────┘
+                       │
+            ┌──────────▼────────────┐
+            │ Plots (§9)            │
+            └───────────────────────┘
 ```
+
+The top half (database, loaders, profiler) is only needed for wall-clock
+measurements or re-profiling. **Everything in the simulated-results path
+runs from the shipped profiles with no database at all** — see the
+quickstart below.
 
 ---
 
-## 1. System Prerequisites
+## 1. Quickstart — no database required
 
-### 1.1 Docker
-
-Docker is required for the PostgreSQL instance.
+The per-query page-access profiles for all three workloads are committed
+under `page_access/` (TPC-H SF10, TPC-DS SF10, JOB/IMDB — profiling
+provenance per workload in §4). That means the full simulated-F_hit
+comparison is reproducible on a laptop in minutes:
 
 ```bash
-docker --version
-docker compose version
+git clone -b demo-paper https://github.com/Stefanjafry/Queryosity-Killed-The-Cache.git
+cd Queryosity-Killed-The-Cache
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+export PYTHONHASHSEED=0
+python -m src.bayesopt.run_regret_sweep \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch
 ```
 
-### 1.2 Launch PostgreSQL
+`--cache-pages 102400` is 800 MB of 8 KB pages — one of the nine
+(workload × cache) configurations in the paper grid. The run sweeps
+`w_regret` over the 13-point grid for both consumers, prints the best
+F_hit per (matrix, consumer) arm with greedy references, and writes a
+JSON summary to `experiment_logs/regret_sweep/`. Expect a few minutes;
+larger workloads (TPC-DS: 93 queries, JOB: 113) take proportionally
+longer.
 
-From the repository root:
+The GA baselines at the same configuration (this is the slow part —
+population 100 × 200 generations, exact-sim final scoring):
+
+```bash
+python -m src.bayesopt.run_baselines \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch
+```
+
+Always set `PYTHONHASHSEED=0`. The sweep is seed-invariant by
+construction, but the GA is seeded, and hash-order stability keeps every
+run byte-reproducible. To reproduce the full nine-configuration table
+(every method at every workload × cache) in one command, see §5.4.
+
+---
+
+## 2. PostgreSQL setup (wall-clock measurements only)
+
+Two supported paths. The **native** path is what produced the paper's
+wall-clock numbers; Docker is the low-friction way to get started.
+
+### 2.1 Docker
 
 ```bash
 docker compose up -d
-docker ps   # should list a container named: query_scheduler_pg
+docker ps   # container: query_scheduler_pg
 ```
 
-Defaults: `host=localhost`, `port=5432`, `user=postgres`, `password=postgres`.
+Defaults: `host=localhost`, `port=5432`, `user=postgres`,
+`password=postgres`. Cache flushes are performed with
+`docker restart query_scheduler_pg` (the tools' default).
 
-### 1.3 Python Environment
+### 2.2 Python environment
 
-This project targets Python 3.9+.
+Tested on Python 3.12 (3.10+ required).
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For DQN training you will also need a working PyTorch install. CPU-only
-PyTorch is already in `requirements.txt`; for CUDA, follow the
-[official instructions](https://pytorch.org/get-started/locally/).
+### 2.3 Required Postgres settings
 
-### 1.4 Adding Dependencies
+Two settings are load-bearing for every measurement in this project:
 
-```bash
-source venv/bin/activate
-pip install <package>
-pip freeze > requirements.txt
+```sql
+ALTER SYSTEM SET enable_seqscan = off;
+ALTER SYSTEM SET max_parallel_workers_per_gather = 0;
+SELECT pg_reload_conf();
 ```
 
-Commit the updated `requirements.txt`.
+`enable_seqscan = off` prevents PostgreSQL's 256 KB ring-buffer
+optimization from routing large sequential scans around the shared
+buffer pool — with the ring buffer active, pages loaded by one query are
+invisible to the next and the premise of cross-query reuse collapses.
+Disabling parallel gather keeps page-access profiles deterministic.
+`shared_buffers` is varied per experiment (see §7).
+
+### 2.4 Native PostgreSQL (paper configuration)
+
+The wall-clock results were produced on a native PostgreSQL 16 install
+(RHEL), not Docker. Every tool that flushes the buffer cache accepts
+`--flush-cmd`; for native installs use:
+
+```
+--flush-cmd "sudo systemctl restart postgresql-16"
+```
+
+(`src.experiment.run_sweep` already defaults to this command; the
+profiler and executor default to Docker restart and need the flag.)
+Two operational notes that will save you failed multi-hour runs:
+
+- Add a NOPASSWD sudoers rule for exactly that restart command (e.g. in
+  `/etc/sudoers.d/pg_restart`). sudo's cached password expires mid-run
+  otherwise, and the sweep dies hours in.
+- Never run `psql`, `sudo`, or `systemctl` against the instance from
+  another terminal while a sweep is running — the restart kills the
+  sweep's connection and contaminates the run.
 
 ---
 
-## 2. Installing Benchmarks
+## 3. Installing benchmarks
 
-Three workloads are supported: **TPC-H**, **TPC-DS**, and **JOB** (the Join
-Order Benchmark on the IMDB dataset). Only the workloads you intend to use
-need to be loaded.
+Three workloads: **TPC-H SF10** (22 queries), **TPC-DS SF10** (93
+queries after exclusions; the excluded ten are kept in
+`workloads/tpcds_excluded/`), and **JOB** on IMDB (113 queries). Load
+only what you intend to measure — the shipped profiles already cover
+all three for simulation.
 
-> **NOTE:** Setup scripts were tested on RHEL. Other Linux distros should work;
-> macOS/Windows users may need to rebuild the TPC-DS binaries. Data
-> directories are expected **outside** the repo (e.g. `../tpch-data-sf10/`).
+> Setup scripts were tested on RHEL. Data directories are expected
+> **outside** the repo (e.g. `../tpch-data-sf10/`).
 
-### 2.1 TPC-H
-
-#### Generate data
+### 3.1 TPC-H
 
 ```bash
 git clone https://github.com/gregrahn/tpch-kit
-cd tpch-kit/dbgen
-make
-./dbgen -s 10          # Scale Factor 10
+cd tpch-kit/dbgen && make && ./dbgen -s 10
+mkdir ../../tpch-data-sf10 && mv *.tbl ../../tpch-data-sf10
 ```
-
-Move the generated `.tbl` files outside the repo:
-
-```bash
-mkdir ../../tpch-data-sf10
-mv *.tbl ../../tpch-data-sf10
-```
-
-Expected project layout:
-
-```
-project-root/
-├── Queryosity-Killed-The-Cache/
-└── tpch-data-sf10/
-    region.tbl  nation.tbl  supplier.tbl  customer.tbl
-    part.tbl    partsupp.tbl  orders.tbl  lineitem.tbl
-```
-
-#### Load into Postgres
 
 ```bash
 cd tpch_scripts
 chmod +x *.sh
-export CONTAINER_NAME=query_scheduler_pg
-export POSTGRES_USER=postgres
-export DB_NAME=tpch
-export DATA_DIR=../../tpch-data-sf10
+export CONTAINER_NAME=query_scheduler_pg POSTGRES_USER=postgres \
+       DB_NAME=tpch DATA_DIR=../../tpch-data-sf10
 ./setup_tpch.sh
 ```
 
-#### Verify
+Verify: `SELECT COUNT(*) FROM lineitem;` ≈ 60 M rows at SF10.
+Queries live in `workloads/tpch/`.
 
-```bash
-docker exec -it query_scheduler_pg psql -U postgres -d tpch -c "SELECT COUNT(*) FROM lineitem;"
-```
+### 3.2 TPC-DS
 
-At SF10 this should return ~60M rows.
-
-The 22 benchmark queries live in `workloads/tpch/`. If you need to regenerate
-them with different parameters:
-
-```bash
-cd tpch-kit/dbgen
-for i in {1..22}; do ./qgen $i > query$i.sql; done
-```
-
-### 2.2 TPC-DS
-
-Linux `dsdgen`/`dsqgen` binaries are pre-compiled in `tpcds_scripts/LINUX/`.
-For other platforms, build from [tpcds-kit](https://github.com/gregrahn/tpcds-kit).
-
-#### Generate data
-
-From `tpcds_scripts/`, use the parallel generator:
+Linux `dsdgen`/`dsqgen` binaries are pre-built in
+`tpcds_scripts/LINUX/`; other platforms build from
+[tpcds-kit](https://github.com/gregrahn/tpcds-kit) (on RHEL/GCC 11 add
+`-fcommon` to CFLAGS).
 
 ```bash
 cd tpcds_scripts
-./run_dsdgen_parallel.sh   # edit scale factor / output dir inside the script
-```
-
-Expected layout:
-
-```
-project-root/
-├── Queryosity-Killed-The-Cache/
-└── tpcds-data-sf10/
-```
-
-#### Load into Postgres
-
-```bash
-cd tpcds_scripts
+./run_dsdgen_parallel.sh    # edit scale factor / output dir inside
 ./setup_tpcds.sh
 ```
 
-This runs the same five-step pipeline as TPC-H (create DB → schema → load →
-indexes → ANALYZE).
+### 3.3 JOB / IMDB
 
-### 2.3 JOB / IMDB
-
-The Join Order Benchmark runs against the IMDB dataset.
-
-#### Get the data
-
-Download the IMDB CSVs (the `imdb.tgz` archive published by the JOB authors)
-and extract to a directory outside the repo, e.g. `~/imdb-data/`.
-
-#### Load into Postgres
+Download the JOB authors' `imdb.tgz`, extract outside the repo, then:
 
 ```bash
 cd job_scripts
 chmod +x *.sh
-export CONTAINER_NAME=query_scheduler_pg
-export POSTGRES_USER=postgres
-export DB_NAME=imdb
-export DATA_DIR=/absolute/path/to/imdb-data
+export CONTAINER_NAME=query_scheduler_pg POSTGRES_USER=postgres \
+       DB_NAME=imdb DATA_DIR=/absolute/path/to/imdb-data
 ./setup_job.sh
 ```
 
-JOB queries live in `workloads/job/` (113 queries) and the workload is
-registered as `job` in `src/utilities/constants.py`, pointing at the `imdb`
-database. You can pass `--workload job` to the profiler and scheduler.
-
 ---
 
-## 3. Page-Level Profiling (prerequisite for page-level sim & DQN training)
+## 4. Page-level profiling
 
-The scheduler can run in two modes:
-
-- **Table-level** — uses estimated per-table page counts from `EXPLAIN`. No
-  profiling needed; the scheduler falls back to this if no page data is
-  present.
-- **Page-level** — uses the exact set of 8 KB pages each query touches,
-  captured via `pg_buffercache`. Produces much more accurate hit-ratio
-  estimates and is required for DQN training.
-
-### Run the profiler
+Profiles are the `(table, block)` page sets each query touches,
+captured from `pg_buffercache` after running the query against a cold
+buffer. **You do not need to run this** unless the data, schema, or
+Postgres configuration changes — `page_access/{tpch,tpcds,job}/` ship
+in the repo.
 
 ```bash
-source venv/bin/activate
 python -m src.profiler.run_profiler --workload tpch
-python -m src.profiler.run_profiler --workload tpcds
+# native install:
+python -m src.profiler.run_profiler --workload tpch \
+    --flush-cmd "sudo systemctl restart postgresql-16"
 ```
 
-What happens:
+Flags: `--workload`, `--output-dir` (default
+`page_access/<workload>/`; use a distinct dir when re-profiling at a
+non-default `shared_buffers`), `--container`, `--flush-cmd`, plus the
+standard connection overrides (`--host --port --user --password
+--schema --timeout-ms`). Profiling restarts Postgres before every query
+— TPC-DS takes hours. Do it once.
 
-1. `pg_buffercache` extension is created if missing.
-2. For each query the Docker container is restarted (cold cache).
-3. The query is executed and `pg_buffercache` is dumped.
-4. A CSV of `(table, block)` pairs is written to `page_access/<workload>/`.
+**Known measurement bound.** `pg_buffercache` only reports pages
+resident in `shared_buffers`, so a profile taken at buffer size S caps
+every query's recorded page set at S pages. A profile capped at or
+below a simulated cache size distorts results at that cache: clamped
+queries cannot fill the simulated buffer. Provenance of the shipped
+profiles:
 
-This is **slow** — it re-runs every query from cold cache. For TPC-DS this
-can take hours. Do it once; results are reused by every downstream tool.
+- **TPC-H** — profiled at 6 GB (cap ≈786 K pages). The four largest
+  `lineitem` queries (`q1`, `q3`, `q6`, `q7`) reach that cap, so their
+  recorded footprints are floors, not exact values. The cap sits above
+  every simulated cache in the paper grid, so no configuration is
+  distorted; relative method comparisons consume identical profiles
+  either way.
+- **TPC-DS** — profiled at 6 GB (cap ≈786 K pages), above every
+  simulated cache in the paper grid, so no configuration is distorted;
+  any query reaching the cap is recorded as a floor.
+- **JOB** — no cap detected; the largest recorded footprints are
+  genuine query sizes.
 
-After profiling, the scheduler automatically picks up `page_access/<workload>/`
-and switches to page-level simulation.
+`src.bayesopt.check_truncation` audits any profile directory for cap
+pile-up and reports a per-cache verdict — run it after any
+re-profiling, and treat a `CORRUPT_IN_RANGE` verdict as disqualifying
+for every cache size at or above the detected cap:
+
+```bash
+python -m src.bayesopt.check_truncation \
+    --workload tpch --page-access-dir page_access/tpch
+```
 
 ---
 
-## 4. GA Scheduler
+## 5. Schedulers (simulator-only)
 
-`src.scheduler.run_scheduler` runs a genetic algorithm over a clock-sweep
-buffer-pool simulator to find a query order that maximizes cache hit ratio.
-
-### Quick start
+### 5.1 Regret sweep — the production scheduler
 
 ```bash
-source venv/bin/activate
-python -m src.scheduler.run_scheduler --workload tpch
+python -m src.bayesopt.run_regret_sweep \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch
 ```
-
-### Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--workload` | `tpch` | `tpch`, `tpcds`, or `job` (must be a key in `WORKLOAD_DIRS`) |
-| `--cache-pages` | `1000` | Simulated buffer-pool size in 8 KB pages |
-| `--algorithm` | `ga` | Scheduling algorithm (`ga` is the only option today) |
-| `--generations` | `200` | GA generations |
-| `--pop` | `100` | GA population size |
-| `--seed` | `None` | Random seed for reproducibility |
-| `--fitness` | `lru` | `lru` (cache simulation) or `dqn` (ONNX surrogate) |
-| `--onnx-path` | `./dqn.onnx` | Path to exported DQN model (for `--fitness dqn`) |
-| `--approximate` | off | Use fast overlap-matrix fitness during GA; exact sim for final result |
+|---|---|---|
+| `--workload` | required | `tpch`, `tpcds`, `job` |
+| `--cache-pages` | required | simulated buffer size in 8 KB pages |
+| `--page-access-dir` | required | profile directory |
+| `--exclude` | `""` | comma-separated query IDs to drop |
+| `--regret-grid` | 13-point default | override the `w_regret` grid |
+| `--beam-widths` | `2,3,4` | beam widths (width 1 = greedy; excluded) |
+| `--seed` | `42` | logging parity only — results are seed-invariant |
+| `--out-dir` | `experiment_logs/regret_sweep` | JSON summary destination |
 
-Postgres connection overrides: `--host --port --user --password --schema --timeout-ms`.
+The runner sweeps both the M and D matrices under both consumers and
+prints greedy references — the M arms and greedy rows are diagnostics;
+the paper methods are the D arms.
 
-### Examples
+### 5.2 GA baselines
 
 ```bash
-# Smaller cache → more eviction pressure → more room for the scheduler to help
-python -m src.scheduler.run_scheduler --workload tpch --cache-pages 500
-
-# Larger GA run with a fixed seed
-python -m src.scheduler.run_scheduler --workload tpcds --generations 300 --pop 150 --seed 42
-
-# Fast approximate fitness during evolution (final score still uses exact sim)
-python -m src.scheduler.run_scheduler --workload tpch --approximate
-
-# DQN surrogate fitness (requires an ONNX model — see §8)
-python -m src.scheduler.run_scheduler --workload tpch --fitness dqn --onnx-path ./dqn.onnx
+python -m src.bayesopt.run_baselines \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch
 ```
 
-### Output
+Regenerates `greedy_d`, `ga_m`, `ga_d` on the exact simulator. GA
+configuration (the reference implementation's defaults, used for every
+GA number in the paper): population 100, 200 generations, tournament
+size 3, swap-mutation rate 0.3, crossover rate 0.9, elitism 2. `GA_M`
+uses the windowed triple-intersection fitness from the original paper;
+`GA_D` uses single-step edge-sum fitness on `D` (the windowed form is
+homogeneous in matrix entries and cancels `D`'s per-row scaling, which
+is why the directional GA does not use it).
 
-The script prints:
+### 5.3 Scheduling-cost benchmark
 
-1. **Baseline** — hit ratio for a random query order.
-2. **GA progress** — best fitness every 50 generations.
-3. **Best schedule** — the GA-optimized order and its simulated hit ratio.
-4. **Improvement** — delta in percentage points over the baseline.
+```bash
+python -m src.bayesopt.bench_schedule_time \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch
+```
 
-It also writes JSON artefacts to `viz_data/` that the visualization module
-consumes (fitness history, profiles, schedules, metadata).
+Times schedule *construction* for the sweep's consumers against the
+GA's evolutionary search, database-free and confound-free
+(`--reps`, `--ga-pop`, `--ga-gen`, `--num-starts` to vary). Scope
+caveat, stated plainly: this measures search cost only. The sweep's
+production selection exact-simulates all ~52 candidates, so the sweep
+does not win on total time including selection — both methods also pay
+one shared exact-sim validation at the end, matching the original
+paper's Figure 15 framing. The end-to-end version of this comparison,
+including selection cost, is §5.5.
+
+### 5.4 Reproduce the paper grid (one command)
+
+```bash
+python -m src.bayesopt.sim_hit_grid
+```
+
+Runs every method at all nine (workload × cache) configurations —
+caches 102400 / 262144 / 524288 pages (800 MB / 2 GB / 4 GB) — prints
+the F_hit table with a per-cell directional-vs-GA_M verdict, and writes
+`experiment_logs/sim_hit_grid.csv`. All parameters are pinned in the
+script (GA 100×200 at seed 42; 13-point regret grid; beam widths
+2/3/4). Per-config query exclusions mirror the wall-clock study so the
+two results axes share query sets; the sets differ across cache sizes
+within a workload, so cross-cache trends inherit that caveat, while
+per-cell method comparisons are unaffected (all methods share the
+set). The 18 GA runs dominate the cost — expect on the order of an
+hour or more on a laptop.
+
+### 5.5 End-to-end scheduling cost
+
+```bash
+python -m src.bayesopt.bench_end_to_end \
+    --workload tpch --cache-pages 262144 \
+    --page-access-dir page_access/tpch --reps 3
+```
+
+The companion to §5.3's search-cost benchmark, answering the
+total-cost question: Q1 times GA_M (search + one exact-sim validation)
+against the sweep as implemented (construction + exact-sim scoring of
+every candidate) — the sweep loses this comparison, which is the basis
+for the scope caveat in §5.3. Q2 checks whether ranking candidates by
+the cheap step-score and exact-simming only the winner ("Framing B")
+selects the same schedule as exact-sim-all — it does not in general,
+which is why that shortcut was retired. Q3 prices in GA hyperparameter
+tuning (N trial searches) against the sweep's zero tuning knobs.
+
+### 5.6 Upstream GA scheduler CLI
+
+`src.scheduler.run_scheduler` is the original Queryosity entry point
+(GA over the clock-sweep simulator, `--approx-mode
+{symmetric,directional}`, optional DQN surrogate fitness). It is kept
+working for continuity with the upstream README; the paper pipeline
+uses §5.1–5.3.
 
 ---
 
-## 5. Executor (real-database measurement)
+## 6. Exporting schedules for wall-clock runs
 
-The scheduler uses a *model* of the cache. The executor runs queries against
-the actual Postgres instance with `EXPLAIN (ANALYZE, BUFFERS)` and reports
-real shared-buffer hits and reads.
-
-### Quick start
+`export_schedules` regenerates the chosen methods' orderings for one
+(workload, cache) — deterministic under the pinned seed — and writes
+the JSON that `run_sweep` consumes:
 
 ```bash
-source venv/bin/activate
-
-# Run in default file order
-python -m src.executor.run_executor --workload tpch
-
-# Run a scheduler-optimized order
-python -m src.executor.run_executor --workload tpch --order q5,q12,q1,q3,...
+python -m src.bayesopt.export_schedules \
+    --workload tpch --cache-pages 102400 \
+    --page-access-dir page_access/tpch \
+    --out schedules/tpch_102400.json
 ```
-
-### Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--workload` | `tpch` | `tpch`, `tpcds`, or `job` |
-| `--order` | `None` | Comma-separated query IDs. Omit for file order. |
-| `--compare-baseline` | off | Execute both orders and print a side-by-side comparison |
-| `--container` | `query_scheduler_pg` | Docker container (used to flush cache) |
+|---|---|---|
+| `--methods` | `GA_M,GA_D,sweep_D,sweep_beam_D` | any subset of `random,GA_M,GA_D,sweep_D,sweep_beam_D` |
+| `--num-starts` | `4` | multistart K for `sweep_D` |
+| `--regret-grid` / `--sweep-beam-widths` | 13-point / `2,3,4` | sweep parameters |
+| `--ga-pop` / `--ga-gen` | `100` / `200` | GA size |
+| `--seed` | `42` | GA seed (sweep methods are seed-invariant) |
+| `--exclude` | `""` | drop query IDs before scheduling |
 
-Postgres connection overrides as above.
-
-### Example
-
-```bash
-python -m src.executor.run_executor \
-  --workload tpch \
-  --order q5,q12,q1,q3,q14,q6 \
-  --compare-baseline
-```
-
-With `--compare-baseline`, two JSON result files land in `viz_data/` for
-plotting (`baseline_results_<workload>.json`, `ga_results_<workload>.json`).
+Output format: `{"cache_label": "<cache>", "schedules": {"<method>":
+"q1,q3,…"}}`.
 
 ---
 
-## 6. Visualizations
-
-After running the scheduler and (optionally) the executor:
+## 7. Wall-clock measurement
 
 ```bash
-# Scheduler plots: fitness curve, page overlap matrix, cache sensitivity
-python -m src.visualization.run_visualizations --workload tpch
-
-# Executor plots: per-query hit ratio, cumulative I/O
-python -m src.visualization.run_visualizations --workload tpch --executor
-
-# Both
-python -m src.visualization.run_visualizations --workload tpch --executor --scheduler
+python -m src.experiment.run_sweep \
+    --workload tpch \
+    --schedules-file schedules/tpch_102400.json \
+    --reps 3 \
+    --out results/tpch_102400.csv
 ```
 
-PNGs are written to `plots/`. Inputs come from the JSON files in `viz_data/`
-produced by the scheduler and executor runs, so those must be run first.
+Before each rep, `shared_buffers` is flushed via `--flush-cmd`
+(default: `sudo systemctl restart postgresql-16`). Set
+`shared_buffers` in `postgresql.conf` to match the simulated cache of
+the schedules file (800 MB ↔ 102400 pages), restart, then run.
+
+Protocol notes required to interpret (or reproduce) the numbers
+honestly:
+
+- **Buffer-cold, OS-warm.** The default flush restarts Postgres, which
+  empties `shared_buffers` but leaves the OS page cache warm. Reads
+  and hit ratios are directly comparable to the original paper's
+  protocol; absolute wall-clock times are optimistic versus true cold
+  disk. `--drop-os-cache` (default cmd `sudo sysctl -w
+  vm.drop_caches=3`) gives true-cold numbers — but it changes *every*
+  number, so it is all-or-nothing across a comparison. Expect rep 1 to
+  run slower than reps 2–3 under the OS-warm protocol as the page
+  cache warms; that is noise, not a method effect.
+- **Exclusions must be uniform.** If a query is excluded (timeout or
+  pathology), exclude it for *every* method at that configuration, or
+  the query sets differ and the comparison is contaminated. For
+  cache-trend comparisons, keep exclusions uniform per workload across
+  cache sizes as well.
+- **Known pathological queries.** TPC-H `q5` is computation-bound
+  (17–21 min at every cache size; scheduling cannot help it) and is
+  excluded. `q13` is I/O-sensitive (9.5 min at 800 MB, ~1 min at
+  larger caches) and is included under a 15-minute statement timeout
+  (`--timeout-ms 900000`). TPC-DS `query17/25/29/23a/23b` are known
+  runaways.
+
+Plot results with:
+
+```bash
+python -m src.experiment.plot_sweep --results results/tpch_102400.csv \
+    --out-prefix plots/tpch_102400
+```
+
+For single-order runs and side-by-side comparisons against file order,
+`src.executor.run_executor` (`--order q5,q12,…`, `--compare-baseline`,
+`--flush-cmd`) measures real shared-buffer hits and reads via
+`EXPLAIN (ANALYZE, BUFFERS)`.
 
 ---
 
-## 7. SmartQueue / DQN Baseline
-
-The `ml/` directory contains the Deep-Q-Network baseline used as a
-comparison point against the GA scheduler. The training workflow is a
-Jupytext-paired notebook: edit `ml/dqn.notebook.py`, open `ml/dqn.ipynb` in
-Jupyter, or run the paired `.py` cells directly.
-
-### 7.1 Prerequisites
-
-- Python environment from §1.3 (PyTorch required — CUDA recommended).
-- Page access CSVs for the target benchmark. Run §3 first:
-  ```bash
-  python -m src.profiler.run_profiler --workload tpch
-  ```
-
-### 7.2 Training
-
-Launch Jupyter from the repository root:
+## 8. Tests and type checking
 
 ```bash
-source venv/bin/activate
-jupyter lab     # or: jupyter notebook
-```
-
-Open `ml/dqn.ipynb` and run all cells. The first four cells prompt for:
-
-| Prompt | Example | Meaning |
-|--------|---------|---------|
-| `Name` | `tpch-sf10` | Used to name the saved checkpoint `<Name>.pt` |
-| `Benchmark` | `tpch` | Subdirectory of `page_access/` to read CSVs from (`tpch`, `tpcds`, `job`) |
-| `Cache capacity in 8kb pages` | `1000` | Must match the cache size you will evaluate against |
-| `Number of episodes` | `500` | DQN training episodes |
-
-The notebook:
-
-1. Reads `page_access/<benchmark>/q{1..22}.csv`.
-2. Builds per-query page sets and a per-table block-count index.
-3. Trains the DQN via `DQNTrainer.train(...)` (ε-greedy, target net, replay).
-4. Saves the checkpoint to `ml/<Name>.pt`.
-5. Plots training loss curves.
-6. Runs a greedy scheduling loop: at each step, pick the query with the
-   highest Q-value given the current cache state; simulate; repeat.
-7. Prints the resulting schedule and average hit rate.
-
-### 7.3 Reproducing the SmartQueue baseline numbers
-
-1. Load and profile TPC-H at SF10 (§2.1, §3).
-2. Open `ml/dqn.ipynb`.
-3. Inputs: `Name=tpch-sf10-1000`, `Benchmark=tpch`, `Cache=1000`, `Episodes=500`.
-4. Run all cells.
-5. Record the final schedule and average hit rate printed by the last cell.
-6. Compare against the GA result from §4 at the same cache capacity.
-
-Repeat for TPC-DS and JOB by changing the `Benchmark` prompt (and adjusting
-the `range(1, 23)` loop in the notebook if your workload has a different
-query count).
-
-### 7.4 Limitations / known gaps
-
-- The notebook currently hard-codes the query range `range(1, 23)` (TPC-H's
-  22 queries). For TPC-DS or JOB, edit that range to match the number of
-  `q{N}.csv` files in `page_access/<benchmark>/`.
-- The notebook saves a PyTorch `.pt` checkpoint only. The
-  `--fitness dqn` path in `src.scheduler.run_scheduler` expects an **ONNX**
-  file and uses a different (table-level) state encoding than the notebook's
-  (page-level) encoding. Exporting the notebook's model to ONNX therefore
-  will **not** plug directly into the GA scheduler — the DQN hook in the GA
-  is experimental scaffolding, not a finished integration. Use the
-  notebook's own scheduling loop to obtain SmartQueue baseline numbers.
-
----
-
-## 8. Running the Full Pipeline (end-to-end example)
-
-For a fresh checkout targeting TPC-H at SF10:
-
-```bash
-# 1. Infrastructure
-docker compose up -d
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-
-# 2. Benchmark data
-cd tpch_scripts
-export CONTAINER_NAME=query_scheduler_pg POSTGRES_USER=postgres \
-       DB_NAME=tpch DATA_DIR=../../tpch-data-sf10
-./setup_tpch.sh
-cd ..
-
-# 3. Page profiling (slow — do once)
-python -m src.profiler.run_profiler --workload tpch
-
-# 4. GA scheduler
-python -m src.scheduler.run_scheduler --workload tpch --cache-pages 1000 --seed 42
-
-# 5. Executor — measure on real Postgres
-python -m src.executor.run_executor --workload tpch \
-       --order <paste-ga-order-here> --compare-baseline
-
-# 6. Plots
-python -m src.visualization.run_visualizations --workload tpch --executor --scheduler
-
-# 7. SmartQueue baseline (notebook)
-jupyter lab ml/dqn.ipynb
-```
-
----
-
-## 9. Running Tests
-
-```bash
-source venv/bin/activate
 python -m pytest tests/ -v
+./venv/bin/pyright --pythonpath ./venv/bin/python src/ tests/
 ```
+
+The suite (86 tests) covers the simulator, both matrices and their
+invariants, the step scorer and consumers, the GA, profile loading, and
+the truncation checker. Pyright (pinned 1.1.408 in requirements) is
+clean on `src/` and `tests/`; run it before every commit.
 
 ---
 
-## 10. Repository Layout
+## 9. Visualizations
+
+```bash
+python -m src.visualization.run_visualizations --workload tpch --scheduler
+python -m src.visualization.run_visualizations --workload tpch --executor
+```
+
+Consumes the JSON artifacts in `viz_data/` written by the scheduler and
+executor runs; writes PNGs to `plots/`. `src/visualization/
+directional_matrix.py` renders the M-vs-D comparison heatmap.
+
+---
+
+## 10. SmartQueue / DQN baseline (upstream, unchanged)
+
+`ml/` contains the Deep-Q-Network baseline inherited from the original
+project (a reimplementation of SmartQueue), kept as-is for comparison
+and continuity: `dqn.ipynb` (jupytext-paired with `dqn.notebook.py`)
+and `dqntrainer.py`. It requires PyTorch and the page profiles; see the
+notebook's prompts. The DQN hook in `run_scheduler` (`--fitness dqn`)
+remains experimental scaffolding, as in the upstream README.
+
+---
+
+## 11. Repository layout
 
 ```
 src/
-├── postgres/        connection & execute helpers
-├── scheduler/       GA scheduler (run_scheduler, genetic_algorithm, …)
-├── executor/        real-DB executor (run_executor)
-├── profiler/        pg_buffercache page-access profiler
-├── simulator/       clock-sweep cache simulator + DQN inference wrapper
-├── utilities/       constants, configuration, workload loader
-└── visualization/   plotting entry point + individual plot modules
-ml/
-├── dqn.ipynb        SmartQueue training notebook (paired via jupytext)
-├── dqn.notebook.py  editable .py view of the notebook
-└── dqntrainer.py    DQN architecture and training loop
-workloads/
-├── tpch/            22 TPC-H queries
-└── tpcds/           adapted TPC-DS query subset
-tpch_scripts/        TPC-H DB setup (schema, load, PK/FK)
-tpcds_scripts/       TPC-DS DB setup (+ pre-built Linux dsdgen/dsqgen)
-job_scripts/         JOB/IMDB DB setup
-tests/               pytest suite
-page_access/         (generated) pg_buffercache profiler output
-viz_data/            (generated) scheduler/executor JSON artefacts
-plots/               (generated) PNG output from visualizations
+├── bayesopt/         profile loader, exact objective, step scorer +
+│                     consumers, regret sweep, sim_hit_grid (paper
+│                     table), GA baselines, export_schedules,
+│                     bench_schedule_time, bench_end_to_end,
+│                     check_truncation
+├── scheduler/        GA (genetic_algorithm, genetic_config, greedy_directional)
+├── simulator/        clock-sweep cache simulator, M and D matrices
+├── experiment/       wall-clock sweep runner + plotting
+├── executor/         real-DB executor (EXPLAIN ANALYZE, BUFFERS)
+├── profiler/         pg_buffercache page-access profiler
+├── utilities/        constants, configuration, workload loader
+└── visualization/    plotting modules
+page_access/          shipped page profiles (tpch, tpcds, job); see §4
+                      for per-workload profiling provenance
+workloads/            SQL query sets (+ tpcds_excluded/)
+tpch_scripts/ tpcds_scripts/ job_scripts/   database setup
+ml/                   upstream DQN baseline
+tests/                pytest suite (86 tests)
 ```
+
+The directional matrix implementation lives in
+`src/simulator/cache_simulator.py` (`compute_residual`,
+`compute_directional_matrix`); the step scorer and both consumers in
+`src/bayesopt/step_scorer.py`; the sweep in
+`src/bayesopt/run_regret_sweep.py`.
+
+---
+
+## Credits
+
+Original system and paper: Rafael Dolores, Mahnsi Ruparelia, Daniel
+Di Giovanni — *Queryosity Killed the Cache: Scheduling Queries in
+Relational DBMS* (EECS 6414, York University). Directional extension:
+Stefan Jafry (MSc, York University; advisor Rafael Dolores).

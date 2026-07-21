@@ -104869,11 +104869,12 @@ pg_operator,8
 pg_operator,12
 pg_operator,13
 pg_rewrite,12
-pg_statistic,6
-pg_statistic,14
+pg_statistic,5
+pg_statistic,12
 pg_statistic,20
-pg_statistic,25
 pg_statistic,27
 pg_statistic,28
-pg_statistic,32
+pg_statistic,30
+pg_statistic,31
+pg_statistic,38
 pg_trigger,0
