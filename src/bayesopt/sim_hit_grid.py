@@ -8,14 +8,19 @@ beats GA_M. Deterministic; no seed sensitivity for the sweep methods.
 
 Run from the repo root:
     ./venv/bin/python -m src.bayesopt.sim_hit_grid
+Set QKC_WORKERS to parallelise exact-simulation selection, e.g.
+``QKC_WORKERS=4``; 0 means all cores. Selection only — the schedules and
+F_hit values are identical at any worker count.
 """
 
 import csv
+import os
 from pathlib import Path
 
 from src.bayesopt.data import load_workload_pages
 from src.bayesopt.objective import ExactSimObjective
 from src.bayesopt.run_baselines import compute_baseline_schedule
+from src.bayesopt.selection import resolve_workers, score_pool
 from src.bayesopt.step_scorer import (
     ScorerWeights, beam_search_schedule, good_start_set, make_step_scorer,
     multistart_greedy_schedules, row_normalize,
@@ -64,7 +69,21 @@ def best_by_fhit(scheds, fhit):
     return best_s, best_f
 
 
+def best_pooled(scheds, page_sets, cap, D, workers):
+    """Dedup + (optionally parallel) exact-score; strict > keeps build order."""
+    cands = [tuple(s) for s in scheds]
+    scores, n_distinct = score_pool(cands, page_sets, cap, D, workers)
+    best_s, best_f = None, -1.0
+    for c, f in zip(cands, scores):
+        if f > best_f:
+            best_f, best_s = f, list(c)
+    return best_s, best_f, n_distinct
+
+
 def main() -> None:
+    workers = resolve_workers(int(os.environ.get("QKC_WORKERS", "1")))
+    if workers > 1:
+        print(f"selection workers: {workers}")
     rows_out = []
     print(f"{'workload':7s} {'cache':>7s} {'n':>4s} | "
           f"{'GA_M':>7s} {'GA_D':>7s} {'sweep_D':>8s} {'sweepBeam':>9s} | "
@@ -96,20 +115,21 @@ def main() -> None:
         ga_d = fhit(compute_baseline_schedule("ga_d", ints, wp.query_ids, D,
                                               cap, SEED, GA_POP, GA_GEN))
 
-        # sweep_D (multistart) and sweep_beam_D — regret sweep, keep best
+        # sweep_D (multistart) and sweep_beam_D — independent consumers,
+        # each deduplicated and exact-scored over its OWN candidate pool.
         starts = good_start_set(Dn, pc, 4)
-        _, sweep_d = best_by_fhit(
-            (s for wr in REGRET_GRID
+        _, sweep_d, nd_ms = best_pooled(
+            [s for wr in REGRET_GRID
              for s in multistart_greedy_schedules(
                  make_step_scorer(Dn, ScorerWeights(w_regret=wr), pc, cap),
-                 n, pc, starts)),
-            fhit)
-        _, sweep_beam = best_by_fhit(
-            (s for wr in REGRET_GRID for bw in BEAM_WIDTHS
+                 n, pc, starts)],
+            wp.page_sets, cap, D, workers)
+        _, sweep_beam, nd_beam = best_pooled(
+            [s for wr in REGRET_GRID for bw in BEAM_WIDTHS
              for s in beam_search_schedule(
                  make_step_scorer(Dn, ScorerWeights(w_regret=wr), pc, cap),
-                 n, pc, bw)),
-            fhit)
+                 n, pc, bw)],
+            wp.page_sets, cap, D, workers)
 
         best_dir = max(ga_d, sweep_d, sweep_beam)
         beats = best_dir > ga_m
@@ -123,6 +143,7 @@ def main() -> None:
             "workload": wl, "cache": cap, "n": n,
             "GA_M": round(ga_m, 4), "GA_D": round(ga_d, 4),
             "sweep_D": round(sweep_d, 4), "sweep_beam_D": round(sweep_beam, 4),
+            "sims_sweep_D": nd_ms, "sims_sweep_beam_D": nd_beam,
             "best_directional_beats_GA_M": beats,
         })
 

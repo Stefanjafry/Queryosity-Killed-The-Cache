@@ -41,6 +41,7 @@ from pathlib import Path
 
 from src.bayesopt.data import load_workload_pages
 from src.bayesopt.objective import ExactSimObjective
+from src.bayesopt.selection import resolve_workers, score_pool
 from src.bayesopt.step_scorer import (
     ScorerWeights,
     beam_search_schedule,
@@ -69,6 +70,7 @@ class SweepResult:
     best_w_regret: float
     best_extra: dict[str, float]  # e.g. {"beam_width": 4} for beam
     n_evals: int
+    n_distinct: int = 0  # exact simulations actually run after dedup
     grid_fhits: list[tuple[float, float]] = field(default_factory=list)
     # list of (w_regret, best_fhit_at_that_regret)
 
@@ -80,16 +82,40 @@ def _sweep_multistart(
     n: int,
     fhit,
     grid: list[float],
+    page_sets: list[frozenset[int]] | None = None,
+    d_matrix: list[list[int]] | None = None,
+    workers: int = 1,
 ) -> SweepResult:
-    """Exhaustive w_regret sweep on the multistart-greedy consumer."""
+    """
+    Exhaustive w_regret sweep on the multistart-greedy consumer.
+
+    Candidates are built for the whole grid, deduplicated, then exact-scored
+    (optionally in parallel). Reduction order is unchanged, so the selected
+    schedule is identical to the serial implementation.
+    """
     starts = good_start_set(immediate, pagecounts, k=4)
-    best = SweepResult(-1.0, 0.0, {}, 0)
+    cands: list[tuple[int, ...]] = []
+    per_wr: list[int] = []
     for wr in grid:
         w = ScorerWeights(w_regret=wr)
         score = make_step_scorer(immediate, w, pagecounts, cache_pages)
         scheds = multistart_greedy_schedules(score, n, pagecounts, starts)
-        f = max(fhit(s) for s in scheds)
-        best.n_evals += len(scheds)
+        cands.extend(tuple(s) for s in scheds)
+        per_wr.append(len(scheds))
+
+    if page_sets is None:
+        scores = [fhit(list(c)) for c in cands]
+        n_distinct = len(set(cands))
+    else:
+        scores, n_distinct = score_pool(cands, page_sets, cache_pages,
+                                        d_matrix, workers)
+
+    best = SweepResult(-1.0, 0.0, {}, 0, n_distinct)
+    o = 0
+    for wr, cnt in zip(grid, per_wr):
+        f = max(scores[o:o + cnt])
+        o += cnt
+        best.n_evals += cnt
         best.grid_fhits.append((wr, f))
         if f > best.best_fhit:
             best.best_fhit, best.best_w_regret, best.best_extra = f, wr, {}
@@ -104,29 +130,53 @@ def _sweep_beam(
     fhit,
     grid: list[float],
     beam_widths: tuple[int, ...],
+    page_sets: list[frozenset[int]] | None = None,
+    d_matrix: list[list[int]] | None = None,
+    workers: int = 1,
 ) -> SweepResult:
     """
     w_regret sweep on the beam consumer.
 
     For every (w_regret, width) pair the best schedule the beam returns is
     exact-scored; the single best cell over the whole grid is kept.
+    Candidates are deduplicated before scoring; reduction order is unchanged.
     """
-    best = SweepResult(-1.0, 0.0, {}, 0)
+    cands: list[tuple[int, ...]] = []
+    cells: list[tuple[float, int, int]] = []  # (wr, bw, count)
     for wr in grid:
         w = ScorerWeights(w_regret=wr)
         score = make_step_scorer(immediate, w, pagecounts, cache_pages)
-        best_at_wr = -1.0
         for bw in beam_widths:
             beams = beam_search_schedule(score, n, pagecounts, bw)
-            f = max(fhit(s) for s in beams)
-            best.n_evals += len(beams)
-            if f > best_at_wr:
-                best_at_wr = f
-            if f > best.best_fhit:
-                best.best_fhit = f
-                best.best_w_regret = wr
-                best.best_extra = {"beam_width": float(bw)}
-        best.grid_fhits.append((wr, best_at_wr))
+            cands.extend(tuple(s) for s in beams)
+            cells.append((wr, bw, len(beams)))
+
+    if page_sets is None:
+        scores = [fhit(list(c)) for c in cands]
+        n_distinct = len(set(cands))
+    else:
+        scores, n_distinct = score_pool(cands, page_sets, cache_pages,
+                                        d_matrix, workers)
+
+    best = SweepResult(-1.0, 0.0, {}, 0, n_distinct)
+    o = 0
+    cur_wr, best_at_wr = None, -1.0
+    for wr, bw, cnt in cells:
+        if cur_wr is not None and wr != cur_wr:
+            best.grid_fhits.append((cur_wr, best_at_wr))
+            best_at_wr = -1.0
+        cur_wr = wr
+        f = max(scores[o:o + cnt])
+        o += cnt
+        best.n_evals += cnt
+        if f > best_at_wr:
+            best_at_wr = f
+        if f > best.best_fhit:
+            best.best_fhit = f
+            best.best_w_regret = wr
+            best.best_extra = {"beam_width": float(bw)}
+    if cur_wr is not None:
+        best.grid_fhits.append((cur_wr, best_at_wr))
     return best
 
 
@@ -137,6 +187,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--page-access-dir", type=Path, required=True)
     p.add_argument("--exclude", default="")
     p.add_argument("--seed", type=int, default=42)  # kept for logging parity
+    p.add_argument(
+        "--workers", type=int, default=1,
+        help="parallel worker processes for exact-sim selection "
+             "(1 = serial; 0 = all cores). Selection only; the selected "
+             "schedule is identical at any worker count.")
     p.add_argument(
         "--regret-grid", default="",
         help="Comma-separated w_regret values; blank = default fine grid.",
@@ -190,6 +245,10 @@ def main(argv: list[str] | None = None) -> None:
         make_step_scorer(M_norm, ScorerWeights(), pc, args.cache_pages),
         wp.n, pc))
 
+    workers = resolve_workers(args.workers)
+    if workers > 1:
+        print(f"  selection workers: {workers}")
+
     arms = {"M": M_norm, "D": D_norm}
     consumers = ("multistart", "beam")
 
@@ -200,11 +259,12 @@ def main(argv: list[str] | None = None) -> None:
             t = time.perf_counter()
             if consumer == "multistart":
                 res = _sweep_multistart(
-                    immediate, pc, args.cache_pages, wp.n, fhit, grid)
+                    immediate, pc, args.cache_pages, wp.n, fhit, grid,
+                    wp.page_sets, D, workers)
             else:
                 res = _sweep_beam(
                     immediate, pc, args.cache_pages, wp.n, fhit, grid,
-                    beam_widths)
+                    beam_widths, wp.page_sets, D, workers)
             dt = time.perf_counter() - t
             results[consumer][arm] = res
             extra = (
@@ -214,7 +274,7 @@ def main(argv: list[str] | None = None) -> None:
             print(
                 f"  {consumer:10s} {arm}: F_hit={res.best_fhit:.4f} "
                 f"@ w_regret={res.best_w_regret:g}{extra} "
-                f"({res.n_evals} evals, {dt:.1f}s)"
+                f"({res.n_evals} cands -> {res.n_distinct} sims, {dt:.1f}s)"
             )
 
     # references line
