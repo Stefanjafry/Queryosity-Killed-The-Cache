@@ -1,4 +1,4 @@
-# Queryosity Killed The Cache — Directional Query Scheduling
+# Queryosity Killed The Cache, Directional Query Scheduling
 
 Buffer-aware query scheduling for PostgreSQL 16, extending the
 "Queryosity Killed The Cache" scheduler (Dolores, Ruparelia, Di Giovanni;
@@ -18,7 +18,7 @@ eviction at cache capacity `C`. `D` is asymmetric and cache-size-aware:
 it measures what a predecessor actually leaves behind for a successor,
 not what the two queries share on paper. Two invariants hold by
 construction: `D[i][j] ≤ M[i][j]` pointwise, with equality exactly when
-no eviction occurs — so `D` collapses to `M` when the working set fits
+no eviction occurs, so `D` collapses to `M` when the working set fits
 in cache, and diverges from it under eviction pressure, which is
 precisely where scheduling decisions matter.
 
@@ -29,7 +29,7 @@ weight `w_regret` is swept over a fixed 13-point grid
 step scorer, candidate schedules are built by multistart-greedy (K=4
 starts) and beam search (widths 2/3/4), and every candidate is scored by
 the exact clock-sweep simulator. The best candidate wins. There is no
-training, no tuning of the search itself, and no seed dependence — the
+training, no tuning of the search itself, and no seed dependence, the
 same inputs always produce the same schedule.
 
 **Methods compared in the paper** (all re-scored by the exact simulator):
@@ -44,9 +44,9 @@ same inputs always produce the same schedule.
 `GA_M → GA_D` isolates the matrix (same consumer); `GA_D → sweep_*`
 isolates the consumer (same matrix).
 
-> **Archive branch.** Earlier experimental code — Bayesian-optimization
+> **Archive branch.** Earlier experimental code, Bayesian-optimization
 > scorer tuning (SMAC / BoTorch), the Mode A structured search, residual
-> and windowing ablations, and their runners and tests — is preserved
+> and windowing ablations, and their runners and tests, is preserved
 > unchanged on the branch this one was cut from
 > (`archive/experiments`). BO was retired after the tuned auxiliary
 > weights collapsed to zero in 8/9 configurations, leaving `w_regret` as
@@ -92,15 +92,15 @@ isolates the consumer (same matrix).
 
 The top half (database, loaders, profiler) is only needed for wall-clock
 measurements or re-profiling. **Everything in the simulated-results path
-runs from the shipped profiles with no database at all** — see the
+runs from the shipped profiles with no database at all**, see the
 quickstart below.
 
 ---
 
-## 1. Quickstart — no database required
+## 1. Quickstart, no database required
 
 The per-query page-access profiles for all three workloads are committed
-under `page_access/` (TPC-H SF10, TPC-DS SF10, JOB/IMDB — profiling
+under `page_access/` (TPC-H SF10, TPC-DS SF10, JOB/IMDB, profiling
 provenance per workload in §4). That means the full simulated-F_hit
 comparison is reproducible on a laptop in minutes:
 
@@ -116,7 +116,7 @@ python -m src.bayesopt.run_regret_sweep \
     --page-access-dir page_access/tpch
 ```
 
-`--cache-pages 102400` is 800 MB of 8 KB pages — one of the nine
+`--cache-pages 102400` is 800 MB of 8 KB pages: one of the nine
 (workload × cache) configurations in the paper grid. The run sweeps
 `w_regret` over the 13-point grid for both consumers, prints the best
 F_hit per (matrix, consumer) arm with greedy references, and writes a
@@ -124,7 +124,7 @@ JSON summary to `experiment_logs/regret_sweep/`. Expect a few minutes;
 larger workloads (TPC-DS: 93 queries, JOB: 113) take proportionally
 longer.
 
-The GA baselines at the same configuration (this is the slow part —
+The GA baselines at the same configuration (this is the slow part , 
 population 100 × 200 generations, exact-sim final scoring):
 
 ```bash
@@ -177,7 +177,7 @@ SELECT pg_reload_conf();
 
 `enable_seqscan = off` prevents PostgreSQL's 256 KB ring-buffer
 optimization from routing large sequential scans around the shared
-buffer pool — with the ring buffer active, pages loaded by one query are
+buffer pool, with the ring buffer active, pages loaded by one query are
 invisible to the next and the premise of cross-query reuse collapses.
 Disabling parallel gather keeps page-access profiles deterministic.
 `shared_buffers` is varied per experiment (see §7).
@@ -200,7 +200,7 @@ Two operational notes that will save you failed multi-hour runs:
   `/etc/sudoers.d/pg_restart`). sudo's cached password expires mid-run
   otherwise, and the sweep dies hours in.
 - Never run `psql`, `sudo`, or `systemctl` against the instance from
-  another terminal while a sweep is running — the restart kills the
+  another terminal while a sweep is running, the restart kills the
   sweep's connection and contaminates the run.
 
 ---
@@ -210,7 +210,7 @@ Two operational notes that will save you failed multi-hour runs:
 Three workloads: **TPC-H SF10** (22 queries), **TPC-DS SF10** (93
 queries after exclusions; the excluded ten are kept in
 `workloads/tpcds_excluded/`), and **JOB** on IMDB (113 queries). Load
-only what you intend to measure — the shipped profiles already cover
+only what you intend to measure, the shipped profiles already cover
 all three for simulation.
 
 > Setup scripts were tested on RHEL. Data directories are expected
@@ -267,7 +267,7 @@ export CONTAINER_NAME=query_scheduler_pg POSTGRES_USER=postgres \
 Profiles are the `(table, block)` page sets each query touches,
 captured from `pg_buffercache` after running the query against a cold
 buffer. **You do not need to run this** unless the data, schema, or
-Postgres configuration changes — `page_access/{tpch,tpcds,job}/` ship
+Postgres configuration changes, `page_access/{tpch,tpcds,job}/` ship
 in the repo.
 
 ```bash
@@ -282,7 +282,7 @@ Flags: `--workload`, `--output-dir` (default
 non-default `shared_buffers`), `--container`, `--flush-cmd`, plus the
 standard connection overrides (`--host --port --user --password
 --schema --timeout-ms`). Profiling restarts Postgres before every query
-— TPC-DS takes hours. Do it once.
+,  TPC-DS takes hours. Do it once.
 
 **Known measurement bound.** `pg_buffercache` only reports pages
 resident in `shared_buffers`, so a profile taken at buffer size S caps
@@ -291,20 +291,20 @@ below a simulated cache size distorts results at that cache: clamped
 queries cannot fill the simulated buffer. Provenance of the shipped
 profiles:
 
-- **TPC-H** — profiled at 6 GB (cap ≈786 K pages). The four largest
+- **TPC-H**: profiled at 6 GB (cap ≈786 K pages). The four largest
   `lineitem` queries (`q1`, `q3`, `q6`, `q7`) reach that cap, so their
   recorded footprints are floors, not exact values. The cap sits above
   every simulated cache in the paper grid, so no configuration is
   distorted; relative method comparisons consume identical profiles
   either way.
-- **TPC-DS** — profiled at 6 GB (cap ≈786 K pages), above every
+- **TPC-DS**: profiled at 6 GB (cap ≈786 K pages), above every
   simulated cache in the paper grid, so no configuration is distorted;
   any query reaching the cap is recorded as a floor.
-- **JOB** — no cap detected; the largest recorded footprints are
+- **JOB**, no cap detected; the largest recorded footprints are
   genuine query sizes.
 
 `src.bayesopt.check_truncation` audits any profile directory for cap
-pile-up and reports a per-cache verdict — run it after any
+pile-up and reports a per-cache verdict, run it after any
 re-profiling, and treat a `CORRUPT_IN_RANGE` verdict as disqualifying
 for every cache size at or above the detected cap:
 
@@ -317,7 +317,7 @@ python -m src.bayesopt.check_truncation \
 
 ## 5. Schedulers (simulator-only)
 
-### 5.1 Regret sweep — the production scheduler
+### 5.1 Regret sweep, the production scheduler
 
 ```bash
 python -m src.bayesopt.run_regret_sweep \
@@ -333,11 +333,12 @@ python -m src.bayesopt.run_regret_sweep \
 | `--exclude` | `""` | comma-separated query IDs to drop |
 | `--regret-grid` | 13-point default | override the `w_regret` grid |
 | `--beam-widths` | `2,3,4` | beam widths (width 1 = greedy; excluded) |
-| `--seed` | `42` | logging parity only — results are seed-invariant |
+| `--seed` | `42` | logging parity only; results are seed-invariant |
+| `--workers` | `1` | parallel processes for exact-sim selection (1 = serial, 0 = all cores); selection only. The schedule is identical at any worker count |
 | `--out-dir` | `experiment_logs/regret_sweep` | JSON summary destination |
 
 The runner sweeps both the M and D matrices under both consumers and
-prints greedy references — the M arms and greedy rows are diagnostics;
+prints greedy references, the M arms and greedy rows are diagnostics;
 the paper methods are the D arms.
 
 ### 5.2 GA baselines
@@ -370,7 +371,7 @@ GA's evolutionary search, database-free and confound-free
 (`--reps`, `--ga-pop`, `--ga-gen`, `--num-starts` to vary). Scope
 caveat, stated plainly: this measures search cost only. The sweep's
 production selection exact-simulates all ~52 candidates, so the sweep
-does not win on total time including selection — both methods also pay
+does not win on total time including selection, both methods also pay
 one shared exact-sim validation at the end, matching the original
 paper's Figure 15 framing. The end-to-end version of this comparison,
 including selection cost, is §5.5.
@@ -381,8 +382,8 @@ including selection cost, is §5.5.
 python -m src.bayesopt.sim_hit_grid
 ```
 
-Runs every method at all nine (workload × cache) configurations —
-caches 102400 / 262144 / 524288 pages (800 MB / 2 GB / 4 GB) — prints
+Runs every method at all nine (workload × cache) configurations , 
+caches 102400 / 262144 / 524288 pages (800 MB / 2 GB / 4 GB), prints
 the F_hit table with a per-cell directional-vs-GA_M verdict, and writes
 `experiment_logs/sim_hit_grid.csv`. All parameters are pinned in the
 script (GA 100×200 at seed 42; 13-point regret grid; beam widths
@@ -390,8 +391,13 @@ script (GA 100×200 at seed 42; 13-point regret grid; beam widths
 two results axes share query sets; the sets differ across cache sizes
 within a workload, so cross-cache trends inherit that caveat, while
 per-cell method comparisons are unaffected (all methods share the
-set). The 18 GA runs dominate the cost — expect on the order of an
-hour or more on a laptop.
+set). Set the `QKC_WORKERS` environment variable to parallelize
+exact-simulation selection (`QKC_WORKERS=4`; 0 = all cores); the
+selected schedules and F_hit values are identical at any worker count.
+The CSV additionally records `sims_sweep_D` and `sims_sweep_beam_D`,
+the distinct simulations per consumer after deduplication. The 18 GA
+runs dominate the cost, roughly an hour serial, or ~20 minutes at
+`QKC_WORKERS=4`.
 
 ### 5.5 End-to-end scheduling cost
 
@@ -404,10 +410,10 @@ python -m src.bayesopt.bench_end_to_end \
 The companion to §5.3's search-cost benchmark, answering the
 total-cost question: Q1 times GA_M (search + one exact-sim validation)
 against the sweep as implemented (construction + exact-sim scoring of
-every candidate) — the sweep loses this comparison, which is the basis
+every candidate), the sweep loses this comparison, which is the basis
 for the scope caveat in §5.3. Q2 checks whether ranking candidates by
 the cheap step-score and exact-simming only the winner ("Framing B")
-selects the same schedule as exact-sim-all — it does not in general,
+selects the same schedule as exact-sim-all, it does not in general,
 which is why that shortcut was retired. Q3 prices in GA hyperparameter
 tuning (N trial searches) against the sweep's zero tuning knobs.
 
@@ -424,7 +430,7 @@ uses §5.1–5.3.
 ## 6. Exporting schedules for wall-clock runs
 
 `export_schedules` regenerates the chosen methods' orderings for one
-(workload, cache) — deterministic under the pinned seed — and writes
+(workload, cache), deterministic under the pinned seed, and writes
 the JSON that `run_sweep` consumes:
 
 ```bash
@@ -471,7 +477,7 @@ honestly:
   and hit ratios are directly comparable to the original paper's
   protocol; absolute wall-clock times are optimistic versus true cold
   disk. `--drop-os-cache` (default cmd `sudo sysctl -w
-  vm.drop_caches=3`) gives true-cold numbers — but it changes *every*
+  vm.drop_caches=3`) gives true-cold numbers, but it changes *every*
   number, so it is all-or-nothing across a comparison. Expect rep 1 to
   run slower than reps 2–3 under the OS-warm protocol as the page
   cache warms; that is noise, not a method effect.
@@ -574,6 +580,6 @@ The directional matrix implementation lives in
 ## Credits
 
 Original system and paper: Rafael Dolores, Mahnsi Ruparelia, Daniel
-Di Giovanni — *Queryosity Killed the Cache: Scheduling Queries in
+Di Giovanni, *Queryosity Killed the Cache: Scheduling Queries in
 Relational DBMS* (EECS 6414, York University). Directional extension:
 Stefan Jafry (MSc, York University; advisor Rafael Dolores).
