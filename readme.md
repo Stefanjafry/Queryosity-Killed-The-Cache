@@ -582,4 +582,4 @@ The directional matrix implementation lives in
 Original system and paper: Rafael Dolores, Mahnsi Ruparelia, Daniel
 Di Giovanni, *Queryosity Killed the Cache: Scheduling Queries in
 Relational DBMS* (EECS 6414, York University). Directional extension:
-Stefan Jafry (MSc, York University; advisor Rafael Dolores).
+Stefan Jafry (BSc, York University; advisor Rafael Dolores).
