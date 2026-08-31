@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Queryosity · Interactive Buffer-Aware Query Scheduling</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="app-loading" class="app-loading">
+    <div class="app-loading__pulse"></div>
+    <p>Loading Queryosity…</p>
+  </div>
+
+  <header class="topbar" hidden>
+    <div class="topbar__brand">
+      <span class="topbar__mark" aria-hidden="true"></span>
+      <div class="topbar__title">
+        <strong>Queryosity</strong>
+        <span class="topbar__sub">Interactive Buffer-Aware Query Scheduling</span>
+      </div>
+    </div>
+    <nav class="topbar__nav" id="nav" aria-label="Primary demo views">
+      <button class="nav-item" data-view="planning">Workload Planning</button>
+      <button class="nav-item" data-view="exploration">Schedule Exploration</button>
+      <button class="nav-item" data-view="explain">Explain Schedule</button>
+    </nav>
+    <div class="topbar__status">
+      <button class="ghost-btn" id="theme-toggle" title="Toggle a light theme for paper screenshots">Paper light</button>
+      <button class="ghost-btn" id="open-methodology">How scoring works</button>
+      <span id="backend-badge" class="badge badge--unknown">…</span>
+    </div>
+  </header>
+
+  <main id="views" hidden>
+    <section class="view" data-view="planning" id="view-planning"></section>
+    <section class="view" data-view="exploration" id="view-exploration" hidden></section>
+    <section class="view" data-view="explain" id="view-explain" hidden></section>
+  </main>
+
+  <aside class="drawer" id="methodology-drawer" hidden aria-hidden="true">
+    <div class="drawer__scrim" data-close-methodology></div>
+    <div class="drawer__panel" role="dialog" aria-label="How Queryosity scores schedules" aria-modal="true">
+      <button class="drawer__close" data-close-methodology aria-label="Close">&times;</button>
+      <div id="methodology-body"></div>
+    </div>
+  </aside>
+
+  <div id="fatal" class="fatal" hidden></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

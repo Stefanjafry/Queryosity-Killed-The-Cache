@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+
+# Paper-valid generated schedules/explanations are generated on the Queryosity
+# VM from stored research profiles. Mock artifacts are committed for UI work.
+/data/generated/

@@ -1,0 +1,6 @@
+# Runtime + test dependencies for the Queryosity conference demo.
+# Real scoring imports the main research repository's existing simulator and
+# profile loader, so use the same Python environment as that repository.
+
+Flask>=3.0,<4.0
+pytest>=8.0
