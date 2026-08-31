@@ -51,8 +51,7 @@ isolates the consumer (same matrix).
 > (`archive/experiments`). BO was retired after the tuned auxiliary
 > weights collapsed to zero in 8/9 configurations, leaving `w_regret` as
 > the only active dimension; the exhaustive sweep matches BO within
-> measurement noise while being deterministic. This branch contains only
-> the code the demo paper uses.
+> measurement noise while being deterministic. This branch contains the research implementation and interactive conference demo used by the demo paper.
 
 ---
 
@@ -92,8 +91,62 @@ isolates the consumer (same matrix).
 
 The top half (database, loaders, profiler) is only needed for wall-clock
 measurements or re-profiling. **Everything in the simulated-results path
-runs from the shipped profiles with no database at all**, see the
-quickstart below.
+runs from the shipped profiles with no database at all**.
+
+## Interactive Conference Demo
+
+The `queryosity-whatif-demo/` directory contains the interactive conference
+demo for Queryosity. It exposes the directional scheduling pipeline through
+three paper-facing views while keeping scheduling and simulation in the
+research backend.
+
+### Capacity-Aware Workload Planning
+
+Users select TPC-H, TPC-DS, or JOB/IMDB and a prepared buffer capacity
+(102,400 / 262,144 / 524,288 8-KB pages, approximately 800 MB / 2 GB / 4 GB).
+The interface presents the generated Sweep-D and Sweep+Beam-D schedules with
+their modeled cache hits, modeled misses, and complete-order cache-hit fraction
+`F_hit`.
+
+### Interactive Schedule Exploration
+
+A generated schedule can be loaded into an editable workspace and reordered,
+extended, shortened, randomized, imported, or exported. Each edited order is
+sent directly to the deterministic page-level clock-sweep simulator for one
+complete-order rescore.
+
+Editing does not rerun Sweep-D or Sweep+Beam-D. The interface therefore
+supports interactive what-if exploration without invoking scheduler search.
+
+### Explaining Generated Schedules
+
+For Sweep-D and Sweep+Beam-D, the explanation view exposes the
+capacity-conditioned directional reuse signal `D[i,j;C]`, row-normalized reuse
+`D_hat[i,j]`, regret, construction score, selected regret weight, candidate
+successors, and beam width where applicable.
+
+Sweep-D greedily extends one partial schedule using the regret-aware
+construction score. Sweep+Beam-D instead keeps multiple partial schedules,
+ranks them by cumulative construction score, and prunes back to the selected
+beam width at each depth. Completed candidate schedules are then scored by the
+page-level cache simulator.
+
+### Running the Demo
+
+From the repository root:
+
+```bash
+cd queryosity-whatif-demo
+python -m pip install -r backend/requirements.txt
+
+export PYTHONHASHSEED=0
+
+# Generate paper-valid schedules and explanation artifacts when required.
+python scripts/generate_demo_artifacts.py --all
+
+# Run against the real Queryosity implementation.
+export QKC_SIM_BACKEND=real
+python backend/app.py
 
 ---
 
@@ -566,6 +619,9 @@ page_access/          shipped page profiles (tpch, tpcds, job); see §4
 workloads/            SQL query sets (+ tpcds_excluded/)
 tpch_scripts/ tpcds_scripts/ job_scripts/   database setup
 ml/                   upstream DQN baseline
+queryosity-whatif-demo/  interactive conference demo frontend/backend,
+                        artifact generator, schedule exploration, and
+                        explanation interface
 tests/                pytest suite (86 tests)
 ```
 
